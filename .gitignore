@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
-*.flac
+
 *.wav
 # *.mp3
+node_modules
+.venv
