@@ -106,6 +106,9 @@ COPY_DST_END_CUE    = None  # hotcue number (1–8) or None
 COPY_REPEAT_COUNT   = 1   # repetitions when COPY_DST_END_CUE is None (ignored when DST_END is set)
 COPY_PASTE_MODE     = "ADD"  # "ADD" = mix copy on top of existing audio (layer)
                               # "REPLACE" = overwrite existing audio in the paste region
+COPY_REMOVE_VOCALS  = False  # True = remove vocals from the COPIED section before pasting
+                              # (uses audio-separator MDX-Net; full-track separation is cached
+                              # under ~/.cache/mp3-cutter/instrumentals/ keyed by file mtime)
 
 # ── Example — CUT_TO_END on a different track ─────────────────────────────────
 # MODE                 = "CUT_TO_END"
@@ -1250,7 +1253,7 @@ def compress_to_mp3(input_path, output_path, bitrate_kbps, remove_artwork=False)
 # Copy-beats mixing helper
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _mix_copy_onto_pcm(pcm, sample_rate, src_start, src_end, dst_start, dst_end=None, repeat_count=1, paste_mode="ADD"):
+def _mix_copy_onto_pcm(pcm, sample_rate, src_start, src_end, dst_start, dst_end=None, repeat_count=1, paste_mode="ADD", source_pcm=None):
     """Mix (add) or replace PCM samples from [src_start, src_end) onto the track
     starting at dst_start.
 
@@ -1261,6 +1264,12 @@ def _mix_copy_onto_pcm(pcm, sample_rate, src_start, src_end, dst_start, dst_end=
                     goes past the current end.
     dst_end given → the paste window [dst_start, dst_end) must be N× the copy
                     length; a warning is printed if not.  repeat_count is ignored.
+
+    source_pcm    → optional alternate PCM array (same shape/sr as `pcm`) to
+                    take the copy region from. Used by COPY_REMOVE_VOCALS to
+                    paste the instrumental version of the source while keeping
+                    the destination's original audio intact. None → copy from
+                    `pcm` itself (default behaviour).
 
     pcm must be (n_samples, n_channels) float64.
     Returns the modified pcm array (may be longer than the original).
@@ -1278,7 +1287,15 @@ def _mix_copy_onto_pcm(pcm, sample_rate, src_start, src_end, dst_start, dst_end=
         print("Warning: Copy region is empty — nothing to paste.")
         return pcm
 
-    copy_pcm = pcm[src_start:src_end].copy()  # detach from pcm so REPLACE writes can't clobber the source
+    src_array = source_pcm if source_pcm is not None else pcm
+    # Clamp src window to source array length (instrumental may be ±1 sample
+    # off after resampling).
+    src_end_clamped = min(src_end, len(src_array))
+    copy_pcm = src_array[src_start:src_end_clamped].copy()
+    if len(copy_pcm) < copy_len:
+        # Pad with zeros if the instrumental was shorter than expected.
+        pad = np.zeros((copy_len - len(copy_pcm), n_ch), dtype=np.float64)
+        copy_pcm = np.concatenate([copy_pcm, pad])
 
     if dst_end is None:
         n_reps = max(1, int(repeat_count))
@@ -1321,13 +1338,35 @@ def _mix_copy_onto_pcm(pcm, sample_rate, src_start, src_end, dst_start, dst_end=
 
 # ─── FLAC ───────────────────────────────────────────────────────────────────
 
-def copy_beats_flac(input_path, output_path, src_start, src_end, dst_start, dst_end=None, repeat_count=1, paste_mode="ADD"):
+def _load_instrumental_pcm(input_path, sample_rate, n_channels):
+    """Lazy import wrapper around vocal_remover.get_instrumental_pcm. Kept here
+    so the module imports cleanly when audio-separator isn't installed; the
+    error only fires if the user actually opts in to vocal removal."""
+    # Make sure the sibling vocal_remover.py is importable even if the script
+    # was invoked from a different cwd.
+    _here = os.path.dirname(os.path.abspath(__file__))
+    if _here not in sys.path:
+        sys.path.insert(0, _here)
+    try:
+        from vocal_remover import get_instrumental_pcm
+    except ImportError as e:
+        sys.exit(
+            "Vocal removal requires audio-separator and the local vocal_remover.py.\n"
+            f"Import failed: {e}\n"
+            "Install with:  pip install \"audio-separator[cpu]\""
+        )
+    print("  Removing vocals from copy section (full-track separation, cached) …")
+    return get_instrumental_pcm(input_path, sample_rate=sample_rate, n_channels=n_channels)
+
+
+def copy_beats_flac(input_path, output_path, src_start, src_end, dst_start, dst_end=None, repeat_count=1, paste_mode="ADD", remove_vocals=False):
     info = sf.info(input_path)
     sample_rate = info.samplerate
     subtype = info.subtype
 
     pcm, _ = sf.read(input_path, dtype="float64", always_2d=True)
-    pcm = _mix_copy_onto_pcm(pcm, sample_rate, src_start, src_end, dst_start, dst_end, repeat_count, paste_mode)
+    source_pcm = _load_instrumental_pcm(input_path, sample_rate, pcm.shape[1]) if remove_vocals else None
+    pcm = _mix_copy_onto_pcm(pcm, sample_rate, src_start, src_end, dst_start, dst_end, repeat_count, paste_mode, source_pcm=source_pcm)
 
     sf.write(output_path, pcm, sample_rate, subtype=subtype, format="FLAC")
     _copy_metadata(input_path, output_path, ".flac")
@@ -1337,13 +1376,14 @@ def copy_beats_flac(input_path, output_path, src_start, src_end, dst_start, dst_
 
 # ─── WAV ────────────────────────────────────────────────────────────────────
 
-def copy_beats_wav(input_path, output_path, src_start, src_end, dst_start, dst_end=None, repeat_count=1, paste_mode="ADD"):
+def copy_beats_wav(input_path, output_path, src_start, src_end, dst_start, dst_end=None, repeat_count=1, paste_mode="ADD", remove_vocals=False):
     info = sf.info(input_path)
     sample_rate = info.samplerate
     subtype = info.subtype
 
     pcm, _ = sf.read(input_path, dtype="float64", always_2d=True)
-    pcm = _mix_copy_onto_pcm(pcm, sample_rate, src_start, src_end, dst_start, dst_end, repeat_count, paste_mode)
+    source_pcm = _load_instrumental_pcm(input_path, sample_rate, pcm.shape[1]) if remove_vocals else None
+    pcm = _mix_copy_onto_pcm(pcm, sample_rate, src_start, src_end, dst_start, dst_end, repeat_count, paste_mode, source_pcm=source_pcm)
 
     sf.write(output_path, pcm, sample_rate, subtype=subtype, format="WAV")
     _copy_metadata(input_path, output_path, ".wav")
@@ -1353,7 +1393,7 @@ def copy_beats_wav(input_path, output_path, src_start, src_end, dst_start, dst_e
 
 # ─── M4A ────────────────────────────────────────────────────────────────────
 
-def copy_beats_m4a(input_path, output_path, src_start, src_end, dst_start, dst_end=None, repeat_count=1, paste_mode="ADD"):
+def copy_beats_m4a(input_path, output_path, src_start, src_end, dst_start, dst_end=None, repeat_count=1, paste_mode="ADD", remove_vocals=False):
     try:
         m4a_info            = MP4(input_path)
         encode_bitrate_kbps = max(128, min(320, m4a_info.info.bitrate // 1000))
@@ -1378,7 +1418,8 @@ def copy_beats_m4a(input_path, output_path, src_start, src_end, dst_start, dst_e
         sample_rate = info.samplerate
         subtype     = info.subtype
         pcm, _ = sf.read(tmp_wav, dtype="float64", always_2d=True)
-        pcm = _mix_copy_onto_pcm(pcm, sample_rate, src_start, src_end, dst_start, dst_end, repeat_count, paste_mode)
+        source_pcm = _load_instrumental_pcm(input_path, sample_rate, pcm.shape[1]) if remove_vocals else None
+        pcm = _mix_copy_onto_pcm(pcm, sample_rate, src_start, src_end, dst_start, dst_end, repeat_count, paste_mode, source_pcm=source_pcm)
 
         sf.write(tmp_out_wav, pcm, sample_rate, subtype=subtype, format="WAV")
 
@@ -1397,7 +1438,7 @@ def copy_beats_m4a(input_path, output_path, src_start, src_end, dst_start, dst_e
 
 # ─── MP3 ────────────────────────────────────────────────────────────────────
 
-def copy_beats_mp3(input_path, output_path, src_start, src_end, dst_start, dst_end=None, repeat_count=1, paste_mode="ADD"):
+def copy_beats_mp3(input_path, output_path, src_start, src_end, dst_start, dst_end=None, repeat_count=1, paste_mode="ADD", remove_vocals=False):
     """Mix the copy region onto the MP3, re-encoding only the frames that overlap
     the paste zone.  All other frames are byte-copied untouched.
 
@@ -1481,9 +1522,10 @@ def copy_beats_mp3(input_path, output_path, src_start, src_end, dst_start, dst_e
     pcm = pcm_t.T.astype(np.float64)  # (n_samples, n_ch)
 
     n_ch = pcm.shape[1] if pcm.ndim > 1 else 1
+    source_pcm = _load_instrumental_pcm(input_path, sr, n_ch) if remove_vocals else None
     pcm_mixed = _mix_copy_onto_pcm(pcm, sr, src_start_i, src_end_i, dst_start_i,
                                    None if dst_end is None else int(round(dst_end)),
-                                   repeat_count, paste_mode)
+                                   repeat_count, paste_mode, source_pcm=source_pcm)
 
     # --- Identify which existing frames overlap the paste window ------------
     # paste window in sample space: [dst_start_i, paste_end_sample)
@@ -1855,13 +1897,13 @@ def main():
         )
 
         if ext_lower == ".mp3":
-            copy_beats_mp3(track_abs_path, output_filepath, src_start, src_end, dst_start, dst_end, COPY_REPEAT_COUNT, COPY_PASTE_MODE)
+            copy_beats_mp3(track_abs_path, output_filepath, src_start, src_end, dst_start, dst_end, COPY_REPEAT_COUNT, COPY_PASTE_MODE, COPY_REMOVE_VOCALS)
         elif ext_lower == ".flac":
-            copy_beats_flac(track_abs_path, output_filepath, src_start, src_end, dst_start, dst_end, COPY_REPEAT_COUNT, COPY_PASTE_MODE)
+            copy_beats_flac(track_abs_path, output_filepath, src_start, src_end, dst_start, dst_end, COPY_REPEAT_COUNT, COPY_PASTE_MODE, COPY_REMOVE_VOCALS)
         elif ext_lower == ".m4a":
-            copy_beats_m4a(track_abs_path, output_filepath, src_start, src_end, dst_start, dst_end, COPY_REPEAT_COUNT, COPY_PASTE_MODE)
+            copy_beats_m4a(track_abs_path, output_filepath, src_start, src_end, dst_start, dst_end, COPY_REPEAT_COUNT, COPY_PASTE_MODE, COPY_REMOVE_VOCALS)
         else:
-            copy_beats_wav(track_abs_path, output_filepath, src_start, src_end, dst_start, dst_end, COPY_REPEAT_COUNT, COPY_PASTE_MODE)
+            copy_beats_wav(track_abs_path, output_filepath, src_start, src_end, dst_start, dst_end, COPY_REPEAT_COUNT, COPY_PASTE_MODE, COPY_REMOVE_VOCALS)
 
     else:
         print(f"Error: Unknown MODE '{MODE}'. Valid options: CUT_BETWEEN_CUES, CUT_TO_END, ADD_SILENCE, COMPRESS, COPY_BEATS_BETWEEN_CUES")

@@ -427,6 +427,13 @@
       </div>
       <div class="hint">Off: layer the copy on top of existing audio (default). On: overwrite the existing audio in the paste region.</div>
     </div>
+    <div class="field">
+      <div class="toggle-row">
+        <button class="toggle" id="remove-vocals-toggle"></button>
+        <span class="toggle-label" id="remove-vocals-label">Remove vocals from copied section</span>
+      </div>
+      <div class="hint">Off: copy the source as-is. On: strip vocals from the copied section before pasting (uses audio-separator MDX-Net; first run on a track takes 30 s–2 min and is cached for re-use).</div>
+    </div>
   </div>
 
   <!-- ── Run ───────────────────────────────────────────── -->
@@ -505,6 +512,8 @@ function applyState() {
 
   setToggle("paste-mode-toggle", state.copy_paste_mode === "REPLACE");
   updatePasteModeUI();
+
+  setToggle("remove-vocals-toggle", state.copy_remove_vocals === true);
 
   updateSilenceSourceUI();
   setBitrateTab(state.compress_bitrate || 320);
@@ -908,6 +917,7 @@ document.getElementById("run-btn").addEventListener("click", async () => {
     copy_dst_end_cue:   state.copy_dst_end_cue   ?? null,
     copy_repeat_count:  parseInt(document.getElementById("copy_repeat_count").value) || 1,
     copy_paste_mode:    getToggle("paste-mode-toggle") ? "REPLACE" : "ADD",
+    copy_remove_vocals: getToggle("remove-vocals-toggle"),
   };
 
   // persist state
