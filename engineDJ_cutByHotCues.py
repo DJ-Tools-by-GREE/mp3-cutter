@@ -1342,8 +1342,6 @@ def _mix_copy_onto_pcm(pcm, sample_rate, src_start, src_end, dst_start, dst_end=
         pcm = np.concatenate([pcm, np.zeros((extra, n_ch), dtype=np.float64)])
 
     mode = (paste_mode or "ADD").upper()
-    paste_start = dst_start
-    paste_end   = dst_start + n_reps * copy_len
     for rep in range(n_reps):
         off = dst_start + rep * copy_len
         if mode == "REPLACE":
@@ -1351,14 +1349,12 @@ def _mix_copy_onto_pcm(pcm, sample_rate, src_start, src_end, dst_start, dst_end=
         else:
             pcm[off:off + copy_len] += copy_pcm
 
-    # Soft-clip ONLY the paste region, and ONLY if the sum actually exceeded
-    # [-1, 1].  Applying tanh globally (or even to the whole paste region when
-    # it stays in range) would shave ~2 dB off untouched audio for no reason.
-    if mode != "REPLACE":
-        paste_view = pcm[paste_start:paste_end]
-        if len(paste_view) and np.max(np.abs(paste_view)) > 1.0:
-            pcm[paste_start:paste_end] = np.tanh(paste_view)
-
+    # No soft-clipping. If the ADD-mode sum exceeds [-1, 1] in places, the
+    # integer-PCM encoder will hard-clip those individual samples — same as
+    # any DAW summing two tracks on the master bus. Applying tanh to the
+    # whole paste region (or worse, the whole track) attenuates audio that
+    # didn't need it; the distortion at the few actually-clipping samples
+    # is audibly negligible compared to the global level loss tanh causes.
     return pcm
 
 
