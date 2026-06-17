@@ -2,12 +2,13 @@
 """
 Audio Editor — Edit MP3, FLAC, WAV, or M4A files using Engine DJ hotcues.
 
-Five modes:
-  CUT_BETWEEN_CUES       — remove audio between two hotcue positions
-  CUT_TO_END             — remove audio from a hotcue to the end of the track
-  ADD_SILENCE            — insert a block of silence at a hotcue or a timestamp
-  COMPRESS               — convert FLAC/WAV/M4A to MP3, or re-encode MP3 at a lower bitrate
-  COPY_BEATS_BETWEEN_CUES — copy a section and mix it onto another section (or extend the track)
+Six modes:
+  CUT_BETWEEN_CUES         — remove audio between two hotcue positions
+  CUT_TO_END               — remove audio from a hotcue to the end of the track
+  ADD_SILENCE              — insert a block of silence at a hotcue or a timestamp
+  COMPRESS                 — convert FLAC/WAV/M4A to MP3, or re-encode MP3 at a lower bitrate
+  COPY_BEATS_BETWEEN_CUES  — copy a section and mix it onto another section (or extend the track)
+  COPY_BEATS_BETWEEN_TRACKS — copy a section from a *different* track and mix it onto this track
 
 FLAC and WAV are edited sample-accurately with zero-crossing snap.
 MP3 is edited frame-accurately (lossless, no re-encoding).
@@ -53,6 +54,10 @@ from mutagen.wave import WAVE
 #   "COMPRESS"                — convert FLAC/WAV to MP3, or re-encode MP3 at a lower bitrate
 #   "COPY_BEATS_BETWEEN_CUES" — copy [SRC_START, SRC_END) and mix onto DST_START
 #                               (and optionally DST_END; paste length must be N× copy length)
+#   "COPY_BEATS_BETWEEN_TRACKS" — copy [SRC_START, SRC_END) from a *different* track
+#                               (COPY_X_SOURCE_TRACK_FILENAME) and mix onto this track's
+#                               DST_START (optionally DST_END). The source's PCM is
+#                               resampled/channel-conformed to the target's format.
 MODE = "CUT_BETWEEN_CUES"
 
 # ── Shared settings (used by every mode) ──────────────────────────────────────
@@ -109,6 +114,24 @@ COPY_PASTE_MODE     = "ADD"  # "ADD" = mix copy on top of existing audio (layer)
 COPY_REMOVE_VOCALS  = False  # True = remove vocals from the COPIED section before pasting
                               # (uses audio-separator MDX-Net; full-track separation is cached
                               # under ~/.cache/mp3-cutter/instrumentals/ keyed by file mtime)
+
+# ── COPY_BEATS_BETWEEN_TRACKS settings ───────────────────────────────────────
+# Copy a section from a different track (COPY_X_SOURCE_TRACK_FILENAME) and mix
+# it onto the main track (TRACK_FILENAME). The source's PCM is automatically
+# resampled and channel-conformed to match the target's format before mixing.
+#
+# COPY_X_SRC_*_CUE refer to hotcues on the SOURCE track.
+# COPY_X_DST_*_CUE refer to hotcues on the TARGET (main) track.
+# Same paste-length rules as COPY_BEATS_BETWEEN_CUES:
+#   COPY_X_DST_END_CUE = None  →  COPY_X_REPEAT_COUNT repetitions, extending if needed.
+#   COPY_X_DST_END_CUE = <cue> →  paste region length must be N× copy length.
+COPY_X_SOURCE_TRACK_FILENAME = ""   # filename of the OTHER track to pull audio from
+COPY_X_SRC_START_CUE         = 1    # hotcue on the SOURCE track: start of the copy region
+COPY_X_SRC_END_CUE           = 2    # hotcue on the SOURCE track: end of the copy region
+COPY_X_DST_START_CUE         = 3    # hotcue on the TARGET track: where to start pasting
+COPY_X_DST_END_CUE           = None # hotcue on the TARGET track or None
+COPY_X_REPEAT_COUNT          = 1    # repetitions when COPY_X_DST_END_CUE is None
+COPY_X_PASTE_MODE            = "ADD"  # "ADD" = mix on top, "REPLACE" = overwrite
 
 # ── Example — CUT_TO_END on a different track ─────────────────────────────────
 # MODE                 = "CUT_TO_END"
@@ -1359,13 +1382,92 @@ def _load_instrumental_pcm(input_path, sample_rate, n_channels):
     return get_instrumental_pcm(input_path, sample_rate=sample_rate, n_channels=n_channels)
 
 
-def copy_beats_flac(input_path, output_path, src_start, src_end, dst_start, dst_end=None, repeat_count=1, paste_mode="ADD", remove_vocals=False):
+def _load_source_track_pcm(source_path, target_sample_rate, target_n_channels):
+    """Decode any-format source track to PCM at the target's sample rate and
+    channel layout. Returns (pcm, source_native_sample_rate).
+
+    pcm is a (n_samples, n_channels) float64 array at target_sample_rate.
+    The native sample rate is also returned so callers can rescale the
+    source-side hotcue offsets (which Engine DJ stores in the source's
+    native-rate sample units) to the target sample rate.
+
+    Decoding is delegated to ffmpeg, which handles the resample (`-ar`) and
+    channel-mix (`-ac`) in one pass. Output is read back through soundfile
+    so the rest of the pipeline can treat it like any other PCM array.
+    """
+    if not os.path.isfile(source_path):
+        print(f"\nError: Source track audio not found at:\n  {source_path}")
+        sys.exit(1)
+
+    # Probe native format for the user-facing format-match note + cue rescale.
+    src_sr     = None
+    src_n_ch   = None
+    ext = os.path.splitext(source_path)[1].lower()
+    try:
+        if ext in (".flac", ".wav"):
+            info     = sf.info(source_path)
+            src_sr   = info.samplerate
+            src_n_ch = info.channels
+        elif ext == ".m4a":
+            info     = MP4(source_path).info
+            src_sr   = info.sample_rate
+            src_n_ch = info.channels
+        elif ext == ".mp3":
+            info     = MP3(source_path).info
+            src_sr   = info.sample_rate
+            src_n_ch = info.channels
+    except Exception:
+        pass
+
+    matches = (src_sr == target_sample_rate and src_n_ch == target_n_channels)
+    if matches:
+        print(f"  Source format : {src_sr} Hz / {src_n_ch}-ch  (matches target — no resample)")
+    else:
+        print(
+            f"  Source format : {src_sr} Hz / {src_n_ch}-ch  →  "
+            f"resampling to {target_sample_rate} Hz / {target_n_channels}-ch (target format)"
+        )
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_wav = os.path.join(tmp_dir, "source.wav")
+        cmd = [
+            "ffmpeg", "-y", "-i", source_path,
+            "-ar", str(target_sample_rate),
+            "-ac", str(target_n_channels),
+            "-vn",
+            tmp_wav,
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"Error: ffmpeg failed to decode source track:\n{r.stderr}")
+            sys.exit(1)
+        pcm, _ = sf.read(tmp_wav, dtype="float64", always_2d=True)
+    return pcm, (src_sr or target_sample_rate)
+
+
+def _rescale_src_cues(src_start, src_end, src_native_sr, target_sr):
+    """Convert source-track cue offsets (stored in the source's native sample
+    rate) into indices for the source PCM that has been resampled to
+    target_sr. No-op when the rates match."""
+    if src_native_sr == target_sr or not src_native_sr:
+        return int(round(src_start)), int(round(src_end))
+    scale = target_sr / src_native_sr
+    return int(round(src_start * scale)), int(round(src_end * scale))
+
+
+def copy_beats_flac(input_path, output_path, src_start, src_end, dst_start, dst_end=None, repeat_count=1, paste_mode="ADD", remove_vocals=False, source_track_path=None):
     info = sf.info(input_path)
     sample_rate = info.samplerate
     subtype = info.subtype
 
     pcm, _ = sf.read(input_path, dtype="float64", always_2d=True)
-    source_pcm = _load_instrumental_pcm(input_path, sample_rate, pcm.shape[1]) if remove_vocals else None
+    if source_track_path:
+        # Source decoded at the target's sample rate / channel layout, so the
+        # cue offsets index into it the same way they index into target PCM.
+        source_pcm, src_native_sr = _load_source_track_pcm(source_track_path, sample_rate, pcm.shape[1])
+        src_start, src_end = _rescale_src_cues(src_start, src_end, src_native_sr, sample_rate)
+    else:
+        source_pcm = _load_instrumental_pcm(input_path, sample_rate, pcm.shape[1]) if remove_vocals else None
     pcm = _mix_copy_onto_pcm(pcm, sample_rate, src_start, src_end, dst_start, dst_end, repeat_count, paste_mode, source_pcm=source_pcm)
 
     sf.write(output_path, pcm, sample_rate, subtype=subtype, format="FLAC")
@@ -1376,13 +1478,17 @@ def copy_beats_flac(input_path, output_path, src_start, src_end, dst_start, dst_
 
 # ─── WAV ────────────────────────────────────────────────────────────────────
 
-def copy_beats_wav(input_path, output_path, src_start, src_end, dst_start, dst_end=None, repeat_count=1, paste_mode="ADD", remove_vocals=False):
+def copy_beats_wav(input_path, output_path, src_start, src_end, dst_start, dst_end=None, repeat_count=1, paste_mode="ADD", remove_vocals=False, source_track_path=None):
     info = sf.info(input_path)
     sample_rate = info.samplerate
     subtype = info.subtype
 
     pcm, _ = sf.read(input_path, dtype="float64", always_2d=True)
-    source_pcm = _load_instrumental_pcm(input_path, sample_rate, pcm.shape[1]) if remove_vocals else None
+    if source_track_path:
+        source_pcm, src_native_sr = _load_source_track_pcm(source_track_path, sample_rate, pcm.shape[1])
+        src_start, src_end = _rescale_src_cues(src_start, src_end, src_native_sr, sample_rate)
+    else:
+        source_pcm = _load_instrumental_pcm(input_path, sample_rate, pcm.shape[1]) if remove_vocals else None
     pcm = _mix_copy_onto_pcm(pcm, sample_rate, src_start, src_end, dst_start, dst_end, repeat_count, paste_mode, source_pcm=source_pcm)
 
     sf.write(output_path, pcm, sample_rate, subtype=subtype, format="WAV")
@@ -1393,7 +1499,7 @@ def copy_beats_wav(input_path, output_path, src_start, src_end, dst_start, dst_e
 
 # ─── M4A ────────────────────────────────────────────────────────────────────
 
-def copy_beats_m4a(input_path, output_path, src_start, src_end, dst_start, dst_end=None, repeat_count=1, paste_mode="ADD", remove_vocals=False):
+def copy_beats_m4a(input_path, output_path, src_start, src_end, dst_start, dst_end=None, repeat_count=1, paste_mode="ADD", remove_vocals=False, source_track_path=None):
     try:
         m4a_info            = MP4(input_path)
         encode_bitrate_kbps = max(128, min(320, m4a_info.info.bitrate // 1000))
@@ -1418,7 +1524,11 @@ def copy_beats_m4a(input_path, output_path, src_start, src_end, dst_start, dst_e
         sample_rate = info.samplerate
         subtype     = info.subtype
         pcm, _ = sf.read(tmp_wav, dtype="float64", always_2d=True)
-        source_pcm = _load_instrumental_pcm(input_path, sample_rate, pcm.shape[1]) if remove_vocals else None
+        if source_track_path:
+            source_pcm, src_native_sr = _load_source_track_pcm(source_track_path, sample_rate, pcm.shape[1])
+            src_start, src_end = _rescale_src_cues(src_start, src_end, src_native_sr, sample_rate)
+        else:
+            source_pcm = _load_instrumental_pcm(input_path, sample_rate, pcm.shape[1]) if remove_vocals else None
         pcm = _mix_copy_onto_pcm(pcm, sample_rate, src_start, src_end, dst_start, dst_end, repeat_count, paste_mode, source_pcm=source_pcm)
 
         sf.write(tmp_out_wav, pcm, sample_rate, subtype=subtype, format="WAV")
@@ -1438,7 +1548,7 @@ def copy_beats_m4a(input_path, output_path, src_start, src_end, dst_start, dst_e
 
 # ─── MP3 ────────────────────────────────────────────────────────────────────
 
-def copy_beats_mp3(input_path, output_path, src_start, src_end, dst_start, dst_end=None, repeat_count=1, paste_mode="ADD", remove_vocals=False):
+def copy_beats_mp3(input_path, output_path, src_start, src_end, dst_start, dst_end=None, repeat_count=1, paste_mode="ADD", remove_vocals=False, source_track_path=None):
     """Mix the copy region onto the MP3, re-encoding only the frames that overlap
     the paste zone.  All other frames are byte-copied untouched.
 
@@ -1495,6 +1605,21 @@ def copy_beats_mp3(input_path, output_path, src_start, src_end, dst_start, dst_e
     src_start_i = int(round(src_start))
     src_end_i   = int(round(src_end))
     dst_start_i = int(round(dst_start))
+
+    # --- Decode full track to PCM (needed early so we can rescale source cues
+    #     against the source track's native sample rate before computing
+    #     copy_len / repetitions) -------------------------------------------
+    with PbAudioFile(input_path) as af:
+        pcm_t = af.read(af.frames)   # (n_ch, n_samples) float32
+    pcm = pcm_t.T.astype(np.float64)  # (n_samples, n_ch)
+    n_ch = pcm.shape[1] if pcm.ndim > 1 else 1
+
+    if source_track_path:
+        source_pcm, src_native_sr = _load_source_track_pcm(source_track_path, sr, n_ch)
+        src_start_i, src_end_i = _rescale_src_cues(src_start, src_end, src_native_sr, sr)
+    else:
+        source_pcm = _load_instrumental_pcm(input_path, sr, n_ch) if remove_vocals else None
+
     copy_len    = src_end_i - src_start_i
 
     # Determine number of reps / warn
@@ -1516,13 +1641,6 @@ def copy_beats_mp3(input_path, output_path, src_start, src_end, dst_start, dst_e
     paste_end_sample = dst_start_i + n_reps * copy_len
     total_original_samples = current_sample
 
-    # --- Decode full track to PCM -------------------------------------------
-    with PbAudioFile(input_path) as af:
-        pcm_t = af.read(af.frames)   # (n_ch, n_samples) float32
-    pcm = pcm_t.T.astype(np.float64)  # (n_samples, n_ch)
-
-    n_ch = pcm.shape[1] if pcm.ndim > 1 else 1
-    source_pcm = _load_instrumental_pcm(input_path, sr, n_ch) if remove_vocals else None
     pcm_mixed = _mix_copy_onto_pcm(pcm, sr, src_start_i, src_end_i, dst_start_i,
                                    None if dst_end is None else int(round(dst_end)),
                                    repeat_count, paste_mode, source_pcm=source_pcm)
@@ -1905,8 +2023,91 @@ def main():
         else:
             copy_beats_wav(track_abs_path, output_filepath, src_start, src_end, dst_start, dst_end, COPY_REPEAT_COUNT, COPY_PASTE_MODE, COPY_REMOVE_VOCALS)
 
+    elif MODE == "COPY_BEATS_BETWEEN_TRACKS":
+        # Hotcues for the TARGET (main) track — destinations live here.
+        target_hotcues = get_hotcues(ENGINE_DB_PATH, track_id)
+        print(f"\n  Target hotcues:")
+        for num in sorted(target_hotcues):
+            secs = target_hotcues[num] / 44100
+            mins = int(secs) // 60
+            remainder = secs - mins * 60
+            print(f"    Cue {num}:  {mins}:{remainder:05.2f}  ({target_hotcues[num]:.0f} samples)")
+
+        # Look up the SOURCE track + its hotcues.
+        if not COPY_X_SOURCE_TRACK_FILENAME:
+            print("\nError: COPY_X_SOURCE_TRACK_FILENAME is not set.")
+            sys.exit(1)
+        print(f"\nLooking up source '{COPY_X_SOURCE_TRACK_FILENAME}' in Engine DJ library …")
+        src_track_id, src_rel_path, src_fn = find_track(ENGINE_DB_PATH, COPY_X_SOURCE_TRACK_FILENAME)
+        src_abs_path = resolve_track_path(ENGINE_DB_PATH, src_rel_path)
+        print(f"  Found: {src_fn}")
+        print(f"  Path : {src_abs_path}")
+        if not os.path.isfile(src_abs_path):
+            print(f"\nError: Source audio file not found at:\n  {src_abs_path}")
+            sys.exit(1)
+
+        source_hotcues = get_hotcues(ENGINE_DB_PATH, src_track_id)
+        print(f"\n  Source hotcues:")
+        for num in sorted(source_hotcues):
+            secs = source_hotcues[num] / 44100
+            mins = int(secs) // 60
+            remainder = secs - mins * 60
+            print(f"    Cue {num}:  {mins}:{remainder:05.2f}  ({source_hotcues[num]:.0f} samples)")
+
+        # Validate cue numbers exist on the right track.
+        for label, cue_num in [
+            ("COPY_X_SRC_START_CUE", COPY_X_SRC_START_CUE),
+            ("COPY_X_SRC_END_CUE",   COPY_X_SRC_END_CUE),
+        ]:
+            if cue_num not in source_hotcues:
+                print(f"\nError: {label} hotcue {cue_num} is not set on the source track.")
+                sys.exit(1)
+        if COPY_X_DST_START_CUE not in target_hotcues:
+            print(f"\nError: COPY_X_DST_START_CUE hotcue {COPY_X_DST_START_CUE} is not set on the target track.")
+            sys.exit(1)
+        if COPY_X_DST_END_CUE is not None and COPY_X_DST_END_CUE not in target_hotcues:
+            print(f"\nError: COPY_X_DST_END_CUE hotcue {COPY_X_DST_END_CUE} is not set on the target track.")
+            sys.exit(1)
+
+        src_start = source_hotcues[COPY_X_SRC_START_CUE]
+        src_end   = source_hotcues[COPY_X_SRC_END_CUE]
+        dst_start = target_hotcues[COPY_X_DST_START_CUE]
+        dst_end   = target_hotcues[COPY_X_DST_END_CUE] if COPY_X_DST_END_CUE is not None else None
+
+        if src_start >= src_end:
+            print(
+                f"\nError: COPY_X_SRC_START_CUE ({src_start:.0f}) must be before "
+                f"COPY_X_SRC_END_CUE ({src_end:.0f})."
+            )
+            sys.exit(1)
+        if dst_end is not None and dst_start >= dst_end:
+            print(
+                f"\nError: COPY_X_DST_START_CUE ({dst_start:.0f}) must be before "
+                f"COPY_X_DST_END_CUE ({dst_end:.0f})."
+            )
+            sys.exit(1)
+
+        desc_dst = (
+            f"Cue {COPY_X_DST_START_CUE} – Cue {COPY_X_DST_END_CUE}"
+            if COPY_X_DST_END_CUE is not None
+            else f"Cue {COPY_X_DST_START_CUE} ({COPY_X_REPEAT_COUNT} rep(s), extend if needed)"
+        )
+        print(
+            f"\nCopying source Cue {COPY_X_SRC_START_CUE}–{COPY_X_SRC_END_CUE} "
+            f"from '{src_fn}' onto target {desc_dst} …"
+        )
+
+        if ext_lower == ".mp3":
+            copy_beats_mp3(track_abs_path, output_filepath, src_start, src_end, dst_start, dst_end, COPY_X_REPEAT_COUNT, COPY_X_PASTE_MODE, False, source_track_path=src_abs_path)
+        elif ext_lower == ".flac":
+            copy_beats_flac(track_abs_path, output_filepath, src_start, src_end, dst_start, dst_end, COPY_X_REPEAT_COUNT, COPY_X_PASTE_MODE, False, source_track_path=src_abs_path)
+        elif ext_lower == ".m4a":
+            copy_beats_m4a(track_abs_path, output_filepath, src_start, src_end, dst_start, dst_end, COPY_X_REPEAT_COUNT, COPY_X_PASTE_MODE, False, source_track_path=src_abs_path)
+        else:
+            copy_beats_wav(track_abs_path, output_filepath, src_start, src_end, dst_start, dst_end, COPY_X_REPEAT_COUNT, COPY_X_PASTE_MODE, False, source_track_path=src_abs_path)
+
     else:
-        print(f"Error: Unknown MODE '{MODE}'. Valid options: CUT_BETWEEN_CUES, CUT_TO_END, ADD_SILENCE, COMPRESS, COPY_BEATS_BETWEEN_CUES")
+        print(f"Error: Unknown MODE '{MODE}'. Valid options: CUT_BETWEEN_CUES, CUT_TO_END, ADD_SILENCE, COMPRESS, COPY_BEATS_BETWEEN_CUES, COPY_BEATS_BETWEEN_TRACKS")
         sys.exit(1)
 
     # ── Update the embedded track title ───────────────────────────────────────

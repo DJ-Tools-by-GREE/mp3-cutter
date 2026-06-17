@@ -63,6 +63,14 @@ DEFAULT_STATE = {
     "copy_repeat_count": 1,
     "copy_paste_mode": "ADD",
     "copy_remove_vocals": False,
+    "copy_x_source_filename": "",
+    "copy_x_source_track_id": None,
+    "copy_x_src_start_cue": 1,
+    "copy_x_src_end_cue": 2,
+    "copy_x_dst_start_cue": 3,
+    "copy_x_dst_end_cue": None,
+    "copy_x_repeat_count": 1,
+    "copy_x_paste_mode": "ADD",
 }
 
 
@@ -165,6 +173,29 @@ def _parse_hotcue_blob(blob):
     return hotcues
 
 
+def _probe_audio_format(path):
+    """Return (sample_rate, channels) for an audio file, or (None, None)."""
+    if not path or not os.path.isfile(path):
+        return None, None
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if ext in (".flac", ".wav"):
+            import soundfile as sf
+            info = sf.info(path)
+            return info.samplerate, info.channels
+        elif ext == ".m4a":
+            from mutagen.mp4 import MP4
+            info = MP4(path).info
+            return info.sample_rate, info.channels
+        elif ext == ".mp3":
+            from mutagen.mp3 import MP3
+            info = MP3(path).info
+            return info.sample_rate, info.channels
+    except Exception:
+        return None, None
+    return None, None
+
+
 def get_hotcues_for_track(db_path, filename, track_id=None):
     """Return hotcue data for a track.
 
@@ -241,6 +272,9 @@ def get_hotcues_for_track(db_path, filename, track_id=None):
     result["_track_id"]    = chosen_id
     result["_file_exists"] = file_exists
     result["_abs_path"]    = abs_path
+    sr, n_ch = _probe_audio_format(abs_path)
+    result["_sample_rate"] = sr
+    result["_channels"]    = n_ch
     return result
 
 
@@ -267,6 +301,8 @@ def run_job(params: dict):
 
     # When the UI has already resolved a unique track_id (e.g. after disambiguation)
     # we patch find_track to return that row directly without any interactive prompt.
+    # The second-track lookup (COPY_BEATS_BETWEEN_TRACKS source) uses the source_track_id
+    # the same way: a single patched find_track maps the right filename to the right ID.
     chosen_track_id = params.get("track_id")
     if chosen_track_id is not None:
         try:
@@ -274,20 +310,51 @@ def run_job(params: dict):
         except (TypeError, ValueError):
             chosen_track_id = None
 
-    if chosen_track_id is not None:
+    source_track_id = params.get("copy_x_source_track_id")
+    if source_track_id is not None:
+        try:
+            source_track_id = int(source_track_id)
+        except (TypeError, ValueError):
+            source_track_id = None
+
+    target_filename = params.get("track_filename", "")
+    source_filename = params.get("copy_x_source_filename", "")
+
+    if chosen_track_id is not None or source_track_id is not None:
         db_path_for_patch = params.get("engine_db_path",
                                        os.path.expanduser("~/Music/Engine Library/Database2/m.db"))
 
         def _patched_find_track(db_path, filename):
+            # Pick the right pre-resolved track_id by which filename was passed.
+            tid = None
+            if filename == target_filename and chosen_track_id is not None:
+                tid = chosen_track_id
+            elif filename == source_filename and source_track_id is not None:
+                tid = source_track_id
+
             conn = sqlite3.connect(db_path)
             cur  = conn.cursor()
-            cur.execute("SELECT id, path, filename FROM Track WHERE id = ?", (chosen_track_id,))
+            if tid is not None:
+                cur.execute("SELECT id, path, filename FROM Track WHERE id = ?", (tid,))
+                row = cur.fetchone()
+                conn.close()
+                if row:
+                    return row
+                import sys as _sys
+                print(f"Error: track_id {tid} not found in database.")
+                _sys.exit(1)
+            # Fall back to filename lookup for anything we didn't pre-resolve.
+            cur.execute("SELECT id, path, filename FROM Track WHERE filename = ?", (filename,))
             row = cur.fetchone()
+            if not row:
+                cur.execute("SELECT id, path, filename FROM Track WHERE filename LIKE ?",
+                            (f"%{filename}%",))
+                row = cur.fetchone()
             conn.close()
             if row:
                 return row
             import sys as _sys
-            print(f"Error: track_id {chosen_track_id} not found in database.")
+            print(f"Error: track '{filename}' not found in database.")
             _sys.exit(1)
 
         mod.find_track = _patched_find_track
@@ -337,6 +404,17 @@ def run_job(params: dict):
         raw_mode = (params.get("copy_paste_mode") or "ADD").upper()
         mod.COPY_PASTE_MODE    = "REPLACE" if raw_mode == "REPLACE" else "ADD"
         mod.COPY_REMOVE_VOCALS = bool(params.get("copy_remove_vocals", False))
+
+    elif params["mode"] == "COPY_BEATS_BETWEEN_TRACKS":
+        mod.COPY_X_SOURCE_TRACK_FILENAME = params.get("copy_x_source_filename", "")
+        mod.COPY_X_SRC_START_CUE = int(params["copy_x_src_start_cue"])
+        mod.COPY_X_SRC_END_CUE   = int(params["copy_x_src_end_cue"])
+        mod.COPY_X_DST_START_CUE = int(params["copy_x_dst_start_cue"])
+        raw_dst_end = params.get("copy_x_dst_end_cue")
+        mod.COPY_X_DST_END_CUE   = int(raw_dst_end) if raw_dst_end not in (None, "", 0, "0") else None
+        mod.COPY_X_REPEAT_COUNT  = max(1, int(params.get("copy_x_repeat_count") or 1))
+        raw_mode = (params.get("copy_x_paste_mode") or "ADD").upper()
+        mod.COPY_X_PASTE_MODE    = "REPLACE" if raw_mode == "REPLACE" else "ADD"
 
     buf = io.StringIO()
     try:

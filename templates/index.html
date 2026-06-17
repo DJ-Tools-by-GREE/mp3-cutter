@@ -60,13 +60,13 @@
 
   /* track search */
   .track-search-wrap { position: relative; }
-  #track-search {
+  #track-search, #cbx-source-search {
     background: var(--card); border: 1px solid var(--border); border-radius: 7px;
     color: var(--text); font-size: .95rem; padding: 9px 12px; width: 100%; outline: none;
     transition: border-color .15s;
   }
-  #track-search:focus { border-color: var(--accent); }
-  #track-dropdown {
+  #track-search:focus, #cbx-source-search:focus { border-color: var(--accent); }
+  #track-dropdown, #cbx-source-dropdown {
     display: none; position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 100;
     background: var(--card); border: 1px solid var(--border); border-radius: 7px;
     max-height: 240px; overflow-y: auto;
@@ -253,6 +253,7 @@
       <button class="tab" data-mode="ADD_SILENCE">Add silence</button>
       <button class="tab" data-mode="COMPRESS">Compress</button>
       <button class="tab" data-mode="COPY_BEATS_BETWEEN_CUES">Copy beats</button>
+      <button class="tab" data-mode="COPY_BEATS_BETWEEN_TRACKS">Copy from other track</button>
     </div>
   </div>
 
@@ -436,6 +437,65 @@
     </div>
   </div>
 
+  <!-- ── COPY_BEATS_BETWEEN_TRACKS ─────────────────────── -->
+  <div class="card mode-panel" id="panel-COPY_BEATS_BETWEEN_TRACKS">
+    <h2>Copy beats from another track</h2>
+    <p class="hint" style="margin-bottom:14px;">
+      Pick a section from a <em>different</em> track (its hotcues) and mix it onto
+      this track. Sample rate / channel count of the source are auto-resampled to
+      match the target's format before mixing.
+    </p>
+
+    <div class="field">
+      <label>Source track</label>
+      <div class="track-search-wrap">
+        <input id="cbx-source-search" type="text" placeholder="Type to search the other track…" autocomplete="off">
+        <div id="cbx-source-dropdown"></div>
+      </div>
+      <div class="hint" id="cbx-source-hint"></div>
+      <div class="hint" id="cbx-format-match"></div>
+    </div>
+
+    <div class="grid2">
+      <div class="field">
+        <label>Copy from <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted)">(source cues)</span></label>
+        <div class="cue-grid" id="cbx-src-start-btns"></div>
+        <div class="cue-time" id="cbx-src-start-time"></div>
+      </div>
+      <div class="field">
+        <label>Copy to <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted)">(source cues)</span></label>
+        <div class="cue-grid" id="cbx-src-end-btns"></div>
+        <div class="cue-time" id="cbx-src-end-time"></div>
+      </div>
+    </div>
+    <hr class="sep" style="margin:10px 0;">
+    <div class="grid2">
+      <div class="field">
+        <label>Paste start <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted)">(target cues)</span></label>
+        <div class="cue-grid" id="cbx-dst-start-btns"></div>
+        <div class="cue-time" id="cbx-dst-start-time"></div>
+      </div>
+      <div class="field">
+        <label>Paste end <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted)">(optional, target cues)</span></label>
+        <div class="cue-grid" id="cbx-dst-end-btns"></div>
+        <div class="cue-time" id="cbx-dst-end-time"></div>
+        <div class="hint">Leave unselected for manual repetition count / track extension.</div>
+      </div>
+    </div>
+    <div class="field" id="cbx-repeat-field">
+      <label>Repetitions</label>
+      <input type="number" id="copy_x_repeat_count" min="1" step="1" value="1">
+      <div class="hint">How many times to paste the copied section (only used when no end cue is selected).</div>
+    </div>
+    <div class="field">
+      <div class="toggle-row">
+        <button class="toggle" id="cbx-paste-mode-toggle"></button>
+        <span class="toggle-label" id="cbx-paste-mode-label"></span>
+      </div>
+      <div class="hint">Off: layer the copy on top of the target's audio (default). On: overwrite the existing audio in the paste region.</div>
+    </div>
+  </div>
+
   <!-- ── Run ───────────────────────────────────────────── -->
   <button id="run-btn">Run</button>
 
@@ -451,10 +511,17 @@
 // ── state ──────────────────────────────────────────────────────────────────
 let csvTracks = [];
 let dbTracks  = [];
-let hotcues   = {};   // {cue_num: seconds}
+let hotcues   = {};   // {cue_num: seconds} — target track
 let state     = {};
 let currentMode = "CUT_BETWEEN_CUES";
 let selectedTrackId = null;  // set after disambiguation or single-match lookup
+let targetFormat   = { sr: null, ch: null };
+
+// Source-track state (COPY_BEATS_BETWEEN_TRACKS)
+let sourceHotcues       = {};
+let sourceSelectedId    = null;
+let sourceFilename      = "";
+let sourceFormat        = { sr: null, ch: null };
 
 // ── boot ───────────────────────────────────────────────────────────────────
 async function boot() {
@@ -475,6 +542,9 @@ async function boot() {
   if (state.track_filename) {
     selectedTrackId = null;
     await loadHotcues(state.track_filename);
+  }
+  if (state.copy_x_source_filename) {
+    await loadSourceHotcues(state.copy_x_source_filename, state.copy_x_source_track_id);
   }
 }
 
@@ -515,6 +585,19 @@ function applyState() {
 
   setToggle("remove-vocals-toggle", state.copy_remove_vocals === true);
 
+  // Cross-track copy
+  state.copy_x_src_start_cue = state.copy_x_src_start_cue ?? 1;
+  state.copy_x_src_end_cue   = state.copy_x_src_end_cue   ?? 2;
+  state.copy_x_dst_start_cue = state.copy_x_dst_start_cue ?? 3;
+  state.copy_x_dst_end_cue   = state.copy_x_dst_end_cue   ?? null;
+  document.getElementById("copy_x_repeat_count").value = state.copy_x_repeat_count ?? 1;
+  setToggle("cbx-paste-mode-toggle", state.copy_x_paste_mode === "REPLACE");
+  updateCbxPasteModeUI();
+  updateCbxRepeatFieldVisibility();
+  document.getElementById("cbx-source-search").value = state.copy_x_source_filename || "";
+  sourceSelectedId = state.copy_x_source_track_id ?? null;
+  sourceFilename   = state.copy_x_source_filename || "";
+
   updateSilenceSourceUI();
   setBitrateTab(state.compress_bitrate || 320);
   updateReverbParamsVisibility();
@@ -522,11 +605,12 @@ function applyState() {
 
 // ── mode ───────────────────────────────────────────────────────────────────
 const MODE_DEFAULTS = {
-  CUT_BETWEEN_CUES:        "(Short Edit)",
-  CUT_TO_END:              "(Short Edit)",
-  ADD_SILENCE:             "(Added Silence)",
-  COMPRESS:                "LQ",
-  COPY_BEATS_BETWEEN_CUES: "(Loop Edit)",
+  CUT_BETWEEN_CUES:         "(Short Edit)",
+  CUT_TO_END:               "(Short Edit)",
+  ADD_SILENCE:              "(Added Silence)",
+  COMPRESS:                 "LQ",
+  COPY_BEATS_BETWEEN_CUES:  "(Loop Edit)",
+  COPY_BEATS_BETWEEN_TRACKS:"(Cross Edit)",
 };
 
 function setMode(mode) {
@@ -577,6 +661,7 @@ document.querySelectorAll(".toggle").forEach(btn => {
     if (btn.id === "reverb-toggle-btn")  updateReverbParamsVisibility();
     if (btn.id === "silence-cue-toggle") updateSilenceSourceUI();
     if (btn.id === "paste-mode-toggle")  updatePasteModeUI();
+    if (btn.id === "cbx-paste-mode-toggle") updateCbxPasteModeUI();
     if (btn.id === "search-db-toggle") {
       state.search_full_db = getToggle("search-db-toggle");
       // Reload DB tracks if enabling and not yet loaded
@@ -612,6 +697,133 @@ function updateRepeatFieldVisibility() {
 function updatePasteModeUI() {
   const replace = getToggle("paste-mode-toggle");
   document.getElementById("paste-mode-label").textContent = replace ? "Replace existing audio" : "Layer on top of existing audio";
+}
+
+function updateCbxPasteModeUI() {
+  const replace = getToggle("cbx-paste-mode-toggle");
+  document.getElementById("cbx-paste-mode-label").textContent = replace ? "Replace target audio" : "Layer on top of target audio";
+}
+
+function updateCbxRepeatFieldVisibility() {
+  const noEndCue = state.copy_x_dst_end_cue === null || state.copy_x_dst_end_cue === undefined;
+  document.getElementById("cbx-repeat-field").style.display = noEndCue ? "block" : "none";
+}
+
+function updateFormatMatch() {
+  const el = document.getElementById("cbx-format-match");
+  if (!el) return;
+  const t = targetFormat, s = sourceFormat;
+  if (!t.sr || !s.sr) { el.textContent = ""; el.style.color = ""; return; }
+  const matches = (t.sr === s.sr && t.ch === s.ch);
+  if (matches) {
+    el.textContent  = `✓ Formats match — ${t.sr} Hz / ${t.ch}-ch (no resample needed).`;
+    el.style.color  = "var(--green)";
+  } else {
+    el.textContent  =
+      `⚠ Source ${s.sr} Hz / ${s.ch}-ch does not match target ${t.sr} Hz / ${t.ch}-ch — `
+      + `source will be resampled to the target's format before mixing.`;
+    el.style.color  = "var(--accent)";
+  }
+}
+
+// ── Source-track search (COPY_BEATS_BETWEEN_TRACKS) ───────────────────────
+const cbxSearchEl = document.getElementById("cbx-source-search");
+const cbxDropEl   = document.getElementById("cbx-source-dropdown");
+
+cbxSearchEl.addEventListener("input", () => {
+  const q = cbxSearchEl.value.toLowerCase().trim();
+  if (!q) { cbxDropEl.style.display = "none"; return; }
+  const source = getToggle("search-db-toggle") ? dbTracks : csvTracks;
+  const matches = source.filter(t =>
+    t.label.toLowerCase().includes(q) || t.filename.toLowerCase().includes(q)
+  ).slice(0, 40);
+  if (!matches.length) { cbxDropEl.style.display = "none"; return; }
+  cbxDropEl.innerHTML = matches.map((t, i) =>
+    `<div class="track-opt" data-i="${i}" data-fn="${esc(t.filename)}">
+       ${esc(t.label)}
+       <div class="sub">${esc(t.filename)}</div>
+     </div>`
+  ).join("");
+  cbxDropEl.style.display = "block";
+  cbxDropEl._matches = matches;
+});
+
+cbxDropEl.addEventListener("click", async e => {
+  const opt = e.target.closest(".track-opt");
+  if (!opt) return;
+  const fn = opt.dataset.fn;
+  cbxSearchEl.value     = fn;
+  cbxDropEl.style.display = "none";
+  await loadSourceHotcues(fn);
+});
+
+cbxSearchEl.addEventListener("blur", () => {
+  setTimeout(() => { cbxDropEl.style.display = "none"; }, 150);
+});
+cbxSearchEl.addEventListener("keydown", e => {
+  if (e.key === "Escape") cbxDropEl.style.display = "none";
+  if (e.key === "Enter") {
+    cbxDropEl.style.display = "none";
+    loadSourceHotcues(cbxSearchEl.value.trim());
+  }
+});
+
+async function loadSourceHotcues(filename, trackId) {
+  if (!filename) {
+    sourceHotcues = {}; sourceSelectedId = null; sourceFilename = "";
+    sourceFormat = { sr: null, ch: null };
+    rebuildCueBtns();
+    document.getElementById("cbx-source-hint").textContent = "";
+    updateFormatMatch();
+    return;
+  }
+  sourceFilename = filename;
+  const dbPath = document.getElementById("engine_db_path").value.trim();
+  let url = `/api/hotcues?filename=${encodeURIComponent(filename)}&db_path=${encodeURIComponent(dbPath)}`;
+  if (trackId != null) url += `&track_id=${encodeURIComponent(trackId)}`;
+  const hintEl = document.getElementById("cbx-source-hint");
+
+  try {
+    const data = await fetch(url).then(r => r.json());
+
+    if (data.multiple) {
+      // Auto-pick the first existing match — disambiguating two pickers in one
+      // panel would clutter the UI. The user can refine the filename if wrong.
+      const pick = data.multiple.find(c => c.exists) || data.multiple[0];
+      hintEl.textContent =
+        `⚠ ${data.multiple.length} matches — using ${pick.path}`;
+      return loadSourceHotcues(filename, pick.track_id);
+    }
+    if (data.error) {
+      sourceHotcues = {}; sourceSelectedId = null;
+      sourceFormat = { sr: null, ch: null };
+      hintEl.textContent = "⚠ " + data.error;
+      hintEl.style.color = "var(--red)";
+    } else {
+      sourceSelectedId = data._track_id ?? null;
+      sourceFormat = { sr: data._sample_rate ?? null, ch: data._channels ?? null };
+      sourceHotcues = {};
+      for (const [k, v] of Object.entries(data)) {
+        if (!k.startsWith("_")) sourceHotcues[parseInt(k)] = v;
+      }
+      const count = Object.keys(sourceHotcues).length;
+      let hint = count
+        ? `${count} hotcue${count > 1 ? "s" : ""} found in source track`
+        : "No hotcues found on source track";
+      if (data._file_exists === false) {
+        hint += " — ⚠ audio file not found on disk";
+        hintEl.style.color = "var(--red)";
+      } else {
+        hintEl.style.color = "";
+      }
+      hintEl.textContent = hint;
+    }
+  } catch (e) {
+    sourceHotcues = {}; sourceSelectedId = null;
+    sourceFormat = { sr: null, ch: null };
+  }
+  rebuildCueBtns();
+  updateFormatMatch();
 }
 
 // ── reverb collapsible ─────────────────────────────────────────────────────
@@ -719,6 +931,7 @@ async function loadHotcues(filename, trackId) {
       selectedTrackId = data._track_id ?? null;
       const fileExists = data._file_exists;
       const absPath    = data._abs_path || "";
+      targetFormat = { sr: data._sample_rate ?? null, ch: data._channels ?? null };
 
       // Strip internal keys before using as hotcue map
       hotcues = {};
@@ -743,6 +956,7 @@ async function loadHotcues(filename, trackId) {
     selectedTrackId = null;
   }
   rebuildCueBtns();
+  updateFormatMatch();
 }
 
 // ── disambiguation panel ───────────────────────────────────────────────────
@@ -791,9 +1005,10 @@ document.getElementById("engine_db_path").addEventListener("change", () => {
 });
 
 // ── cue buttons ────────────────────────────────────────────────────────────
-function makeCueBtns(containerId, selectedKey, timeId, onSelect) {
+function makeCueBtns(containerId, selectedKey, timeId, onSelect, hcMap) {
   const container = document.getElementById(containerId);
   const timeEl    = document.getElementById(timeId);
+  const cues      = hcMap || hotcues;
   container.innerHTML = "";
 
   for (let n = 1; n <= 8; n++) {
@@ -801,23 +1016,24 @@ function makeCueBtns(containerId, selectedKey, timeId, onSelect) {
     btn.className = "cue-btn";
     btn.textContent = n;
     btn.dataset.cue = n;
-    if (hotcues[n] !== undefined) btn.classList.add("has-cue");
-    if (n === selectedKey)        btn.classList.add("selected");
+    if (cues[n] !== undefined) btn.classList.add("has-cue");
+    if (n === selectedKey)     btn.classList.add("selected");
     btn.addEventListener("click", () => {
       container.querySelectorAll(".cue-btn").forEach(b => b.classList.remove("selected"));
       btn.classList.add("selected");
       onSelect(n);
-      timeEl.textContent = hotcues[n] !== undefined ? fmtSecs(hotcues[n]) : "";
+      timeEl.textContent = cues[n] !== undefined ? fmtSecs(cues[n]) : "";
     });
     container.appendChild(btn);
   }
-  timeEl.textContent = hotcues[selectedKey] !== undefined ? fmtSecs(hotcues[selectedKey]) : "";
+  timeEl.textContent = cues[selectedKey] !== undefined ? fmtSecs(cues[selectedKey]) : "";
 }
 
-function makeCueBtnsOptional(containerId, selectedKey, timeId, onSelect) {
+function makeCueBtnsOptional(containerId, selectedKey, timeId, onSelect, hcMap) {
   // Like makeCueBtns but includes a "–" (none) button; selectedKey=null means none selected.
   const container = document.getElementById(containerId);
   const timeEl    = document.getElementById(timeId);
+  const cues      = hcMap || hotcues;
   container.innerHTML = "";
 
   // "None" button
@@ -838,18 +1054,18 @@ function makeCueBtnsOptional(containerId, selectedKey, timeId, onSelect) {
     btn.className = "cue-btn";
     btn.textContent = n;
     btn.dataset.cue = n;
-    if (hotcues[n] !== undefined) btn.classList.add("has-cue");
-    if (n === selectedKey)        btn.classList.add("selected");
+    if (cues[n] !== undefined) btn.classList.add("has-cue");
+    if (n === selectedKey)     btn.classList.add("selected");
     btn.addEventListener("click", () => {
       container.querySelectorAll(".cue-btn").forEach(b => b.classList.remove("selected"));
       btn.classList.add("selected");
       onSelect(n);
-      timeEl.textContent = hotcues[n] !== undefined ? fmtSecs(hotcues[n]) : "";
+      timeEl.textContent = cues[n] !== undefined ? fmtSecs(cues[n]) : "";
     });
     container.appendChild(btn);
   }
-  timeEl.textContent = (selectedKey !== null && hotcues[selectedKey] !== undefined)
-    ? fmtSecs(hotcues[selectedKey]) : "";
+  timeEl.textContent = (selectedKey !== null && cues[selectedKey] !== undefined)
+    ? fmtSecs(cues[selectedKey]) : "";
 }
 
 function rebuildCueBtns() {
@@ -864,6 +1080,19 @@ function rebuildCueBtns() {
     state.copy_dst_end_cue = v;
     updateRepeatFieldVisibility();
   });
+
+  // Cross-track copy: src cues come from the SOURCE track's hotcue map,
+  // dst cues come from the TARGET (main) track's map.
+  makeCueBtns("cbx-src-start-btns", state.copy_x_src_start_cue || 1, "cbx-src-start-time",
+              v => { state.copy_x_src_start_cue = v; }, sourceHotcues);
+  makeCueBtns("cbx-src-end-btns",   state.copy_x_src_end_cue   || 2, "cbx-src-end-time",
+              v => { state.copy_x_src_end_cue   = v; }, sourceHotcues);
+  makeCueBtns("cbx-dst-start-btns", state.copy_x_dst_start_cue || 3, "cbx-dst-start-time",
+              v => { state.copy_x_dst_start_cue = v; }, hotcues);
+  makeCueBtnsOptional("cbx-dst-end-btns", state.copy_x_dst_end_cue ?? null, "cbx-dst-end-time", v => {
+    state.copy_x_dst_end_cue = v;
+    updateCbxRepeatFieldVisibility();
+  }, hotcues);
 }
 
 function fmtSecs(s) {
@@ -876,6 +1105,15 @@ function fmtSecs(s) {
 document.getElementById("run-btn").addEventListener("click", async () => {
   const filename = searchEl.value.trim();
   if (!filename) { alert("Select or enter a track filename first."); return; }
+
+  if (currentMode === "COPY_BEATS_BETWEEN_TRACKS") {
+    const srcFn = document.getElementById("cbx-source-search").value.trim();
+    if (!srcFn) { alert("Select or enter the source track filename."); return; }
+    if (srcFn === filename) {
+      alert("Source and target are the same track — use the regular 'Copy beats' mode instead.");
+      return;
+    }
+  }
 
   const params = {
     track_filename:  filename,
@@ -918,6 +1156,16 @@ document.getElementById("run-btn").addEventListener("click", async () => {
     copy_repeat_count:  parseInt(document.getElementById("copy_repeat_count").value) || 1,
     copy_paste_mode:    getToggle("paste-mode-toggle") ? "REPLACE" : "ADD",
     copy_remove_vocals: getToggle("remove-vocals-toggle"),
+
+    // COPY_BEATS_BETWEEN_TRACKS
+    copy_x_source_filename: document.getElementById("cbx-source-search").value.trim(),
+    copy_x_source_track_id: sourceSelectedId,
+    copy_x_src_start_cue:   state.copy_x_src_start_cue || 1,
+    copy_x_src_end_cue:     state.copy_x_src_end_cue   || 2,
+    copy_x_dst_start_cue:   state.copy_x_dst_start_cue || 3,
+    copy_x_dst_end_cue:     state.copy_x_dst_end_cue   ?? null,
+    copy_x_repeat_count:    parseInt(document.getElementById("copy_x_repeat_count").value) || 1,
+    copy_x_paste_mode:      getToggle("cbx-paste-mode-toggle") ? "REPLACE" : "ADD",
   };
 
   // persist state
