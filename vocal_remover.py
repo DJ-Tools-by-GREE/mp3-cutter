@@ -95,6 +95,13 @@ def remove_vocals(
     sep = Separator(
         output_dir=output_dir,
         output_format=output_format,
+        # audio-separator's default of 0.9 pre-attenuates the input before
+        # separation and never compensates on the way out — so a master that
+        # peaks at 0.97 comes out as an instrumental that flat-tops around
+        # 0.75 (0.9/0.97 × peak ≈ 0.75). Setting it to 1.0 means "only
+        # attenuate if input actually clips", which preserves the natural
+        # level of any well-mastered source.
+        normalization_threshold=1.0,
         # log_level=logging.INFO  # uncomment if you want progress chatter
     )
     sep.load_model(model_filename=model_filename)
