@@ -1798,6 +1798,121 @@ def copy_beats_mp3(input_path, output_path, src_start, src_end, dst_start, dst_e
                       reenc_frame_count=_count_mp3_frames(reenc_bytes),
                       repeat_count=repeat_count, paste_mode=paste_mode)
 
+    _verify_mp3_copy_beats_splices(
+        input_path, output_path, sr,
+        src_start_i, src_end_i, dst_start_i, n_reps,
+    )
+
+
+def _verify_mp3_copy_beats_splices(
+    input_path, output_path, sample_rate,
+    src_start_i, src_end_i, dst_start_i, n_reps,
+    inspect_ms=120, silence_thresh_db=-55, click_thresh=0.3,
+):
+    """Decode the edited MP3 and inspect the leading and trailing splice
+    points for three artifact classes that can sneak past the partial-
+    re-encode path: silence gaps (encoder priming), clicks (bad frame
+    drop), and timing offsets (byte-copy region drift).
+
+    Prints findings; does not raise. MP3-only by design — the other
+    formats either have no encoder splice (WAV/FLAC) or pass the whole
+    file through one encoder run (M4A), so this class of artifact
+    cannot occur there.
+    """
+    try:
+        copy_len  = src_end_i - src_start_i
+        paste_end = dst_start_i + n_reps * copy_len
+
+        with PbAudioFile(output_path, "r") as af:
+            out = af.read(af.frames).T
+        with PbAudioFile(input_path, "r") as af:
+            orig = af.read(af.frames).T
+        out_mono  = out.mean(axis=1)  if out.ndim  == 2 else out.flatten()
+        orig_mono = orig.mean(axis=1) if orig.ndim == 2 else orig.flatten()
+    except Exception as e:
+        print(f"  ⚠ Splice verification skipped (decode failed: {e})")
+        return
+
+    inspect = int(inspect_ms / 1000 * sample_rate)
+    findings = []
+
+    def _t(s):
+        m, secs = divmod(s / sample_rate, 60)
+        return f"{int(m)}:{secs:06.3f}"
+
+    def _check(splice, label, with_offset):
+        lo = max(0, splice - inspect)
+        hi = min(len(out_mono), splice + inspect)
+        if hi - lo < int(0.01 * sample_rate):
+            return
+        region = out_mono[lo:hi]
+
+        # ── silence gap ──────────────────────────────────
+        win = max(16, int(0.002 * sample_rate))
+        hop = max(8,  int(0.001 * sample_rate))
+        rms_db = []
+        for i in range(0, len(region) - win, hop):
+            rms = np.sqrt((region[i:i + win] ** 2).mean())
+            rms_db.append(20 * np.log10(rms + 1e-10))
+        if rms_db:
+            rms_db = np.array(rms_db)
+            ctx = np.percentile(rms_db, 75)
+            # only flag if the surrounding audio is clearly non-silent
+            if ctx > -25:
+                quiet = np.where(rms_db < silence_thresh_db)[0]
+                if len(quiet):
+                    gap_ms = (quiet[-1] - quiet[0] + 1) * hop * 1000 / sample_rate
+                    gs = lo + quiet[0] * hop
+                    findings.append((
+                        "silence", _t(gs),
+                        f"{label}: ~{gap_ms:.1f} ms quiet stretch "
+                        f"({rms_db[quiet[0]]:.1f} dBFS vs ctx {ctx:.1f} dBFS)"
+                    ))
+
+        # ── click / discontinuity ────────────────────────
+        d = np.abs(np.diff(region))
+        i = int(np.argmax(d))
+        baseline = np.percentile(d, 99)
+        if d[i] > max(click_thresh, baseline * 6):
+            cs = lo + i
+            if abs(cs - splice) <= int(0.002 * sample_rate):
+                findings.append((
+                    "click", _t(cs),
+                    f"{label}: |Δ|={d[i]:.3f} discontinuity "
+                    f"(baseline P99 |Δ|={baseline:.3f})"
+                ))
+
+        # ── timing offset (leading splice only) ──────────
+        if with_offset and splice > 0:
+            ref_n = int(0.1 * sample_rate)
+            ref_lo = max(0, splice - ref_n)
+            if ref_lo < splice and splice < len(orig_mono):
+                ref = orig_mono[ref_lo:splice]
+                pad = 4096
+                s_lo = max(0, ref_lo - pad)
+                s_hi = min(len(out_mono), splice + pad)
+                search = out_mono[s_lo:s_hi]
+                if len(ref) > 256 and len(search) > len(ref) + 8:
+                    xc = np.correlate(search - search.mean(),
+                                      ref   - ref.mean(), "valid")
+                    lag = int(np.argmax(xc)) - (ref_lo - s_lo)
+                    if abs(lag) > 8:  # > ~0.2 ms
+                        findings.append((
+                            "offset", _t(splice),
+                            f"{label}: byte-copy region drifted by "
+                            f"{lag:+d} samples ({lag * 1000 / sample_rate:+.2f} ms)"
+                        ))
+
+    _check(dst_start_i, "leading splice",  with_offset=True)
+    _check(paste_end,   "trailing splice", with_offset=False)
+
+    if findings:
+        print("  ⚠ Splice verification flagged issues:")
+        for kind, ts, msg in findings:
+            print(f"     [{kind}] {ts}  {msg}")
+    else:
+        print("  ✓ Splice verification: clean")
+
 
 def _print_copy_stats(sample_rate, src_start, src_end, dst_start, dst_end,
                       new_total_samples, output_path, reenc_frame_count=None, repeat_count=1, paste_mode="ADD"):
