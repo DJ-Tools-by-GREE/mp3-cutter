@@ -2,13 +2,15 @@
 """
 Audio Editor — Edit MP3, FLAC, WAV, or M4A files using Engine DJ hotcues.
 
-Six modes:
+Seven modes:
   CUT_BETWEEN_CUES         — remove audio between two hotcue positions
   CUT_TO_END               — remove audio from a hotcue to the end of the track
   ADD_SILENCE              — insert a block of silence at a hotcue or a timestamp
   COMPRESS                 — convert FLAC/WAV/M4A to MP3, or re-encode MP3 at a lower bitrate
   COPY_BEATS_BETWEEN_CUES  — copy a section and mix it onto another section (or extend the track)
   COPY_BEATS_BETWEEN_TRACKS — copy a section from a *different* track and mix it onto this track
+  STEM_SEPARATION          — replace the full track (or a section between two hotcues) with
+                              the vocals-only or instrumental-only stem
 
 FLAC and WAV are edited sample-accurately with zero-crossing snap.
 MP3 is edited frame-accurately (lossless, no re-encoding).
@@ -58,6 +60,10 @@ from mutagen.wave import WAVE
 #                               (COPY_X_SOURCE_TRACK_FILENAME) and mix onto this track's
 #                               DST_START (optionally DST_END). The source's PCM is
 #                               resampled/channel-conformed to the target's format.
+#   "STEM_SEPARATION"         — replace the entire track, or a section between
+#                               STEM_START_CUE / STEM_END_CUE, with one isolated
+#                               stem ("INSTRUMENTAL" = vocals removed, or
+#                               "VOCALS" = vocals only).
 MODE = "CUT_BETWEEN_CUES"
 
 # ── Shared settings (used by every mode) ──────────────────────────────────────
@@ -132,6 +138,19 @@ COPY_X_DST_START_CUE         = 3    # hotcue on the TARGET track: where to start
 COPY_X_DST_END_CUE           = None # hotcue on the TARGET track or None
 COPY_X_REPEAT_COUNT          = 1    # repetitions when COPY_X_DST_END_CUE is None
 COPY_X_PASTE_MODE            = "ADD"  # "ADD" = mix on top, "REPLACE" = overwrite
+
+# ── STEM_SEPARATION settings ──────────────────────────────────────────────────
+# Replace the audio in the track with a single isolated stem (vocals only, or
+# everything-except-vocals). When STEM_START_CUE / STEM_END_CUE are both None,
+# the whole track is replaced. When both are given, only that section is
+# replaced; audio outside the section is left untouched.
+#
+# STEM_KEEP:
+#   "INSTRUMENTAL" — keep the instrumental stem (vocals removed)
+#   "VOCALS"       — keep the vocals stem only (instrumental removed)
+STEM_KEEP       = "INSTRUMENTAL"
+STEM_START_CUE  = None  # hotcue (1–8) marking the start of the section to replace, or None
+STEM_END_CUE    = None  # hotcue (1–8) marking the end of the section to replace, or None
 
 # ── Example — CUT_TO_END on a different track ─────────────────────────────────
 # MODE                 = "CUT_TO_END"
@@ -1364,21 +1383,28 @@ def _load_instrumental_pcm(input_path, sample_rate, n_channels):
     """Lazy import wrapper around vocal_remover.get_instrumental_pcm. Kept here
     so the module imports cleanly when audio-separator isn't installed; the
     error only fires if the user actually opts in to vocal removal."""
-    # Make sure the sibling vocal_remover.py is importable even if the script
-    # was invoked from a different cwd.
+    return _load_stem_pcm(input_path, "instrumental", sample_rate, n_channels)
+
+
+def _load_stem_pcm(input_path, stem, sample_rate, n_channels):
+    """Lazy import wrapper around vocal_remover.get_stem_pcm. The error only
+    fires if the user actually opts into stem separation. Both stems are
+    produced by a single separator run and cached side by side, so calling
+    this twice on the same track (once per stem) only runs the model once."""
     _here = os.path.dirname(os.path.abspath(__file__))
     if _here not in sys.path:
         sys.path.insert(0, _here)
     try:
-        from vocal_remover import get_instrumental_pcm
+        from vocal_remover import get_stem_pcm
     except ImportError as e:
         sys.exit(
-            "Vocal removal requires audio-separator and the local vocal_remover.py.\n"
+            "Stem separation requires audio-separator and the local vocal_remover.py.\n"
             f"Import failed: {e}\n"
             "Install with:  pip install \"audio-separator[cpu]\""
         )
-    print("  Removing vocals from copy section (full-track separation, cached) …")
-    return get_instrumental_pcm(input_path, sample_rate=sample_rate, n_channels=n_channels)
+    label = "instrumental (vocals removed)" if stem == "instrumental" else "vocals only"
+    print(f"  Extracting {label} (full-track separation, cached) …")
+    return get_stem_pcm(input_path, stem=stem, sample_rate=sample_rate, n_channels=n_channels)
 
 
 def _load_source_track_pcm(source_path, target_sample_rate, target_n_channels):
@@ -1791,6 +1817,298 @@ def _print_copy_stats(sample_rate, src_start, src_end, dst_start, dst_end,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Stem separation (replace track or section with one isolated stem)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _splice_stem_pcm(pcm, stem_pcm, section_start, section_end):
+    """Return a new PCM array where samples [section_start, section_end) are
+    overwritten with the corresponding samples from `stem_pcm`. When section_*
+    are None the entire array is replaced.
+
+    Both arrays must already be at the same sample rate / channel count.
+    `stem_pcm` may be ±1 sample off after resampling; the splice clamps to
+    whatever overlap is available and zero-pads if `stem_pcm` is shorter than
+    the section.
+    """
+    pcm = pcm.copy()
+    n_ch = pcm.shape[1] if pcm.ndim > 1 else 1
+
+    if section_start is None and section_end is None:
+        # Whole-track replacement: clamp to the shorter of the two so we don't
+        # introduce off-by-one drift. Pad with zeros if the stem is shorter.
+        n = min(len(pcm), len(stem_pcm))
+        out = np.zeros((len(pcm), n_ch), dtype=np.float64)
+        out[:n] = stem_pcm[:n]
+        return out
+
+    s = int(round(section_start))
+    e = int(round(section_end))
+    s = max(0, min(s, len(pcm)))
+    e = max(s, min(e, len(pcm)))
+    section_len = e - s
+
+    slice_ = stem_pcm[s:s + section_len]
+    if len(slice_) < section_len:
+        pad = np.zeros((section_len - len(slice_), n_ch), dtype=np.float64)
+        slice_ = np.concatenate([slice_, pad])
+
+    pcm[s:e] = slice_
+    return pcm
+
+
+def _print_stem_stats(sample_rate, total_samples, stem_keep, section_start, section_end, output_path):
+    print(f"\n  Stem kept     : {stem_keep}")
+    if section_start is None and section_end is None:
+        print(f"  Replaced      : whole track ({total_samples / sample_rate:.2f} s)")
+    else:
+        sec_len = section_end - section_start
+        print(f"  Replaced      : {section_start / sample_rate:.3f} s – {section_end / sample_rate:.3f} s "
+              f"({sec_len} samples, {sec_len / sample_rate:.3f} s)")
+    print(f"  Output file   : {output_path}")
+
+
+def stem_separation_flac(input_path, output_path, stem_keep, section_start=None, section_end=None):
+    info = sf.info(input_path)
+    sample_rate = info.samplerate
+    subtype = info.subtype
+
+    pcm, _ = sf.read(input_path, dtype="float64", always_2d=True)
+    stem = "instrumental" if stem_keep.upper() == "INSTRUMENTAL" else "vocals"
+    stem_pcm = _load_stem_pcm(input_path, stem, sample_rate, pcm.shape[1])
+
+    out_pcm = _splice_stem_pcm(pcm, stem_pcm, section_start, section_end)
+
+    sf.write(output_path, out_pcm, sample_rate, subtype=subtype, format="FLAC")
+    _copy_metadata(input_path, output_path, ".flac")
+    _print_stem_stats(sample_rate, len(out_pcm), stem_keep, section_start, section_end, output_path)
+
+
+def stem_separation_wav(input_path, output_path, stem_keep, section_start=None, section_end=None):
+    info = sf.info(input_path)
+    sample_rate = info.samplerate
+    subtype = info.subtype
+
+    pcm, _ = sf.read(input_path, dtype="float64", always_2d=True)
+    stem = "instrumental" if stem_keep.upper() == "INSTRUMENTAL" else "vocals"
+    stem_pcm = _load_stem_pcm(input_path, stem, sample_rate, pcm.shape[1])
+
+    out_pcm = _splice_stem_pcm(pcm, stem_pcm, section_start, section_end)
+
+    sf.write(output_path, out_pcm, sample_rate, subtype=subtype, format="WAV")
+    _copy_metadata(input_path, output_path, ".wav")
+    _print_stem_stats(sample_rate, len(out_pcm), stem_keep, section_start, section_end, output_path)
+
+
+def stem_separation_m4a(input_path, output_path, stem_keep, section_start=None, section_end=None):
+    """M4A always involves decode → splice → re-encode (lossy in, lossy out).
+    Bitrate matches the source so quality is preserved as well as AAC allows."""
+    try:
+        m4a_info            = MP4(input_path)
+        encode_bitrate_kbps = max(128, min(320, m4a_info.info.bitrate // 1000))
+    except Exception:
+        encode_bitrate_kbps = 256
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_wav     = os.path.join(tmp_dir, "decoded.wav")
+        tmp_out_wav = os.path.join(tmp_dir, "processed.wav")
+
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", input_path, tmp_wav],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            print(f"Error: ffmpeg decode failed:\n{r.stderr}")
+            sys.exit(1)
+
+        info = sf.info(tmp_wav)
+        sample_rate = info.samplerate
+        subtype     = info.subtype
+        pcm, _ = sf.read(tmp_wav, dtype="float64", always_2d=True)
+
+        stem = "instrumental" if stem_keep.upper() == "INSTRUMENTAL" else "vocals"
+        # Run the separator on the original m4a (audio-separator decodes it natively)
+        # so the cache key is tied to the user's source file rather than the temp wav.
+        stem_pcm = _load_stem_pcm(input_path, stem, sample_rate, pcm.shape[1])
+
+        out_pcm = _splice_stem_pcm(pcm, stem_pcm, section_start, section_end)
+        sf.write(tmp_out_wav, out_pcm, sample_rate, subtype=subtype, format="WAV")
+
+        enc = subprocess.run(
+            ["ffmpeg", "-y", "-i", tmp_out_wav,
+             "-codec:a", "aac", "-b:a", f"{encode_bitrate_kbps}k", output_path],
+            capture_output=True, text=True,
+        )
+        if enc.returncode != 0:
+            print(f"Error: ffmpeg encode failed:\n{enc.stderr}")
+            sys.exit(1)
+
+    _copy_metadata(input_path, output_path, ".m4a")
+    _print_stem_stats(sample_rate, len(out_pcm), stem_keep, section_start, section_end, output_path)
+
+
+def stem_separation_mp3(input_path, output_path, stem_keep, section_start=None, section_end=None):
+    """MP3 stem separation. Strategy mirrors copy_beats_mp3:
+      - whole-track replacement → re-encode the whole thing (no way around it)
+      - section replacement     → keep frames outside the section byte-identical;
+                                  only the frames overlapping the section are
+                                  re-encoded from the spliced PCM.
+    """
+    if not _HAS_PEDALBOARD:
+        sys.exit("Missing dependency: pedalboard\nInstall with: pip install pedalboard")
+
+    with open(input_path, "rb") as f:
+        raw = f.read()
+
+    id3v2_size = read_id3v2_size(raw)
+    id3v2_data = raw[:id3v2_size]
+
+    id3v1_data = b""
+    audio_end  = len(raw)
+    if len(raw) >= 128 and raw[-128:-125] == b"TAG":
+        id3v1_data = raw[-128:]
+        audio_end -= 128
+
+    # Index all frames so we can identify the section frames later.
+    frames = []
+    pos = id3v2_size
+    current_sample = 0
+    file_sample_rate = None
+    spf = None
+    while pos + 4 <= audio_end:
+        info = parse_frame_header(raw[pos:pos + 4])
+        if info is None:
+            pos += 1
+            continue
+        if file_sample_rate is None:
+            file_sample_rate = info["sample_rate"]
+            spf = info["samples_per_frame"]
+        frame_end = pos + info["frame_size"]
+        if frame_end > audio_end:
+            break
+        frames.append((pos, info["frame_size"], current_sample))
+        current_sample += info["samples_per_frame"]
+        pos = frame_end
+
+    if not frames:
+        print("Error: No valid MP3 frames found.")
+        sys.exit(1)
+
+    sr = file_sample_rate
+
+    # Decode the full track to PCM
+    with PbAudioFile(input_path) as af:
+        pcm_t = af.read(af.frames)
+    pcm = pcm_t.T.astype(np.float64)
+    n_ch = pcm.shape[1] if pcm.ndim > 1 else 1
+
+    stem = "instrumental" if stem_keep.upper() == "INSTRUMENTAL" else "vocals"
+    stem_pcm = _load_stem_pcm(input_path, stem, sr, n_ch)
+
+    out_pcm = _splice_stem_pcm(pcm, stem_pcm, section_start, section_end)
+
+    if section_start is None and section_end is None:
+        # Whole-track replacement: re-encode everything in one pass.
+        try:
+            encode_bitrate_kbps = max(128, min(320, MP3(input_path).info.bitrate // 1000))
+        except Exception:
+            encode_bitrate_kbps = 320
+
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav")
+        os.close(tmp_fd)
+        try:
+            sf.write(tmp_path, out_pcm, sr, format="WAV")
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-i", tmp_path,
+                 "-codec:a", "libmp3lame", "-b:a", f"{encode_bitrate_kbps}k",
+                 "-id3v2_version", "3", output_path],
+                capture_output=True, text=True,
+            )
+            if r.returncode != 0:
+                print(f"Error: ffmpeg encode failed:\n{r.stderr}")
+                sys.exit(1)
+        finally:
+            os.unlink(tmp_path)
+        _print_stem_stats(sr, len(out_pcm), stem_keep, section_start, section_end, output_path)
+        return
+
+    # Section replacement: re-encode only the frames overlapping the section,
+    # byte-copy everything else.
+    sec_start_i = int(round(section_start))
+    sec_end_i   = int(round(section_end))
+
+    first_sec_frame = None
+    last_sec_frame  = None
+    for idx, (_, _, fsample) in enumerate(frames):
+        f_end = fsample + spf
+        if f_end > sec_start_i and fsample < sec_end_i:
+            if first_sec_frame is None:
+                first_sec_frame = idx
+            last_sec_frame = idx
+
+    reenc_bytes = b""
+    if first_sec_frame is not None:
+        reenc_start_sample = frames[first_sec_frame][2]
+        reenc_end_sample   = frames[last_sec_frame][2] + spf
+        reenc_end_sample   = min(reenc_end_sample, len(out_pcm))
+        pcm_slice = out_pcm[reenc_start_sample:reenc_end_sample]
+
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".mp3")
+        os.close(tmp_fd)
+        try:
+            with PbAudioFile(tmp_path, "w", samplerate=sr, num_channels=n_ch) as af:
+                af.write(pcm_slice.T.astype(np.float32))
+            with open(tmp_path, "rb") as f:
+                reenc_raw = f.read()
+        finally:
+            os.unlink(tmp_path)
+
+        reenc_id3 = read_id3v2_size(reenc_raw)
+        reenc_audio = reenc_raw[reenc_id3:]
+        if len(reenc_audio) >= 128 and reenc_audio[-128:-125] == b"TAG":
+            reenc_audio = reenc_audio[:-128]
+        reenc_audio = _strip_xing_frame(reenc_audio)
+        reenc_bytes = reenc_audio
+
+    before_bytes = b"".join(
+        raw[foff:foff + fsize]
+        for foff, fsize, _ in frames[:first_sec_frame]
+    ) if first_sec_frame is not None else b""
+    after_start = last_sec_frame + 1 if last_sec_frame is not None else len(frames)
+    after_bytes = b"".join(
+        raw[foff:foff + fsize]
+        for foff, fsize, _ in frames[after_start:]
+    )
+
+    def _count_mp3_frames(data):
+        n, p = 0, 0
+        while p + 4 <= len(data):
+            h = parse_frame_header(data[p:p + 4])
+            if h is None:
+                p += 1
+                continue
+            p += h["frame_size"]
+            n += 1
+        return n
+
+    new_audio = before_bytes + reenc_bytes + after_bytes
+    new_frame_count = _count_mp3_frames(new_audio)
+    new_byte_count  = len(new_audio)
+
+    with open(output_path, "wb") as f:
+        f.write(id3v2_data)
+        first_frame_written = False
+        for chunk in (before_bytes, reenc_bytes, after_bytes):
+            if chunk and not first_frame_written:
+                chunk = _patch_xing_header(chunk, new_frame_count, new_byte_count)
+                first_frame_written = True
+            f.write(chunk)
+        f.write(id3v1_data)
+
+    _print_stem_stats(sr, len(out_pcm), stem_keep, section_start, section_end, output_path)
+    print(f"  Re-enc frames : {_count_mp3_frames(reenc_bytes)}  (all other frames byte-copied)")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -2105,8 +2423,66 @@ def main():
         else:
             copy_beats_wav(track_abs_path, output_filepath, src_start, src_end, dst_start, dst_end, COPY_X_REPEAT_COUNT, COPY_X_PASTE_MODE, False, source_track_path=src_abs_path)
 
+    elif MODE == "STEM_SEPARATION":
+        stem_keep = (STEM_KEEP or "INSTRUMENTAL").upper()
+        if stem_keep not in ("INSTRUMENTAL", "VOCALS"):
+            print(f"\nError: STEM_KEEP must be 'INSTRUMENTAL' or 'VOCALS', got '{STEM_KEEP}'.")
+            sys.exit(1)
+
+        # Optional section. Both cues None → whole-track replacement.
+        section_specified = (STEM_START_CUE is not None) or (STEM_END_CUE is not None)
+        section_start = None
+        section_end   = None
+
+        if section_specified:
+            if STEM_START_CUE is None or STEM_END_CUE is None:
+                print("\nError: STEM_START_CUE and STEM_END_CUE must both be set "
+                      "(or both None for whole-track replacement).")
+                sys.exit(1)
+
+            hotcues = get_hotcues(ENGINE_DB_PATH, track_id)
+            print(f"\n  Available hotcues:")
+            for num in sorted(hotcues):
+                secs = hotcues[num] / 44100
+                mins = int(secs) // 60
+                remainder = secs - mins * 60
+                print(f"    Cue {num}:  {mins}:{remainder:05.2f}  ({hotcues[num]:.0f} samples)")
+
+            if STEM_START_CUE not in hotcues:
+                print(f"\nError: Hotcue {STEM_START_CUE} is not set on this track.")
+                sys.exit(1)
+            if STEM_END_CUE not in hotcues:
+                print(f"\nError: Hotcue {STEM_END_CUE} is not set on this track.")
+                sys.exit(1)
+
+            section_start = hotcues[STEM_START_CUE]
+            section_end   = hotcues[STEM_END_CUE]
+            if section_start >= section_end:
+                print(
+                    f"\nError: STEM_START_CUE ({section_start:.0f}) must be before "
+                    f"STEM_END_CUE ({section_end:.0f})."
+                )
+                sys.exit(1)
+
+        scope_desc = (
+            f"Cue {STEM_START_CUE} – Cue {STEM_END_CUE}"
+            if section_specified
+            else "whole track"
+        )
+        kept_desc = "instrumental (vocals removed)" if stem_keep == "INSTRUMENTAL" else "vocals only"
+        print(f"\nStem separation — keeping {kept_desc} for {scope_desc} …")
+
+        if ext_lower == ".mp3":
+            stem_separation_mp3(track_abs_path, output_filepath, stem_keep, section_start, section_end)
+        elif ext_lower == ".flac":
+            stem_separation_flac(track_abs_path, output_filepath, stem_keep, section_start, section_end)
+        elif ext_lower == ".m4a":
+            stem_separation_m4a(track_abs_path, output_filepath, stem_keep, section_start, section_end)
+        else:
+            stem_separation_wav(track_abs_path, output_filepath, stem_keep, section_start, section_end)
+
     else:
-        print(f"Error: Unknown MODE '{MODE}'. Valid options: CUT_BETWEEN_CUES, CUT_TO_END, ADD_SILENCE, COMPRESS, COPY_BEATS_BETWEEN_CUES, COPY_BEATS_BETWEEN_TRACKS")
+        print(f"Error: Unknown MODE '{MODE}'. Valid options: CUT_BETWEEN_CUES, CUT_TO_END, ADD_SILENCE, COMPRESS, COPY_BEATS_BETWEEN_CUES, COPY_BEATS_BETWEEN_TRACKS, STEM_SEPARATION")
         sys.exit(1)
 
     # ── Update the embedded track title ───────────────────────────────────────

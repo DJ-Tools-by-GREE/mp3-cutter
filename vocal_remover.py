@@ -180,27 +180,72 @@ def get_instrumental_pcm(
     artifacts at the cue boundaries), and the caller slices the section it
     wants from the returned array.
     """
+    return get_stem_pcm(
+        input_path=input_path,
+        stem="instrumental",
+        sample_rate=sample_rate,
+        n_channels=n_channels,
+        model_filename=model_filename,
+        use_cache=use_cache,
+    )
+
+
+def get_stem_pcm(
+    input_path: str,
+    stem: str,
+    sample_rate: int,
+    n_channels: int = 2,
+    model_filename: str = DEFAULT_MODEL,
+    use_cache: bool = True,
+) -> "np.ndarray":  # type: ignore[name-defined]
+    """
+    Return one stem of `input_path` (`"instrumental"` or `"vocals"`) as a
+    `(n_samples, n_channels)` float64 numpy array, resampled / channel-matched
+    to the host track's sample rate and channel count.
+
+    Both stems are produced by a single separator run and cached side by side
+    under `~/.cache/mp3-cutter/instrumentals/<key>.{instrumental,vocals}.flac`,
+    keyed by (path, mtime, model). The first call on a track populates both
+    files; subsequent calls (regardless of which stem was asked for) are
+    instant.
+    """
     import numpy as np
     import soundfile as sf
 
+    stem = stem.lower().strip()
+    if stem not in ("instrumental", "vocals"):
+        raise ValueError(f"Unknown stem '{stem}'. Use 'instrumental' or 'vocals'.")
+
     os.makedirs(CACHE_DIR, exist_ok=True)
     key = _cache_key(input_path, model_filename)
-    cached_flac = os.path.join(CACHE_DIR, f"{key}.flac")
+    cached_inst   = os.path.join(CACHE_DIR, f"{key}.flac")              # legacy name
+    cached_voc    = os.path.join(CACHE_DIR, f"{key}.vocals.flac")
+    cached_target = cached_inst if stem == "instrumental" else cached_voc
 
-    if not (use_cache and os.path.isfile(cached_flac)):
-        # Run the separator into a temp dir, then move the instrumental into the cache.
+    if not (use_cache and os.path.isfile(cached_target)):
+        # Run the separator once and persist BOTH stems so the next call is instant
+        # regardless of which stem was asked for.
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             result = remove_vocals(
                 input_path=input_path,
                 output_dir=tmp,
                 model_filename=model_filename,
-                keep_vocals=False,
+                keep_vocals=True,
                 output_format="FLAC",
             )
-            os.replace(result["instrumental"], cached_flac)
+            if not os.path.isfile(cached_inst):
+                os.replace(result["instrumental"], cached_inst)
+            if result.get("vocals") and not os.path.isfile(cached_voc):
+                os.replace(result["vocals"], cached_voc)
 
-    pcm, sr = sf.read(cached_flac, dtype="float64", always_2d=True)
+    if not os.path.isfile(cached_target):
+        raise RuntimeError(
+            f"Stem '{stem}' was not produced by the separator (missing {cached_target}). "
+            f"The chosen model may not output that stem."
+        )
+
+    pcm, sr = sf.read(cached_target, dtype="float64", always_2d=True)
 
     # Match channel count to host track.
     if pcm.shape[1] != n_channels:
