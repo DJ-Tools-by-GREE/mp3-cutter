@@ -1663,7 +1663,24 @@ def copy_beats_mp3(input_path, output_path, src_start, src_end, dst_start, dst_e
     extension_bytes = b""
 
     if first_paste_frame is not None:
-        reenc_start_sample = frames[first_paste_frame][2]
+        # libmp3lame has ~576 samples of encoder priming/MDCT delay: the very
+        # first audio frame it emits is a silent ramp-up, not real audio. If we
+        # hand it a PCM slice that starts exactly at frames[first_paste_frame],
+        # that priming silence ends up overlaying the original (pre-paste)
+        # audio of that frame, producing an audible ~6 ms gap right before
+        # the paste begins.
+        #
+        # Compensate by extending the re-encode window backward by one full
+        # MP3 frame (1152 samples ≈ 26 ms, safely > 576) of *lead-in* PCM,
+        # encoding it, then discarding the first audio frame of the encoder
+        # output (which is the priming-silence frame). The lead-in region
+        # itself stays covered by the byte-copied originals — we re-encode
+        # it only to give the encoder warm-up context.
+        PRIMING_LEAD_IN_FRAMES = 1
+        extended_first = max(0, first_paste_frame - PRIMING_LEAD_IN_FRAMES)
+        priming_drop_frames = first_paste_frame - extended_first
+
+        reenc_start_sample = frames[extended_first][2]
         reenc_end_sample   = (
             frames[last_paste_frame][2] + spf
             if last_paste_frame is not None
@@ -1698,6 +1715,18 @@ def copy_beats_mp3(input_path, output_path, src_start, src_end, dst_start, dst_e
         # LAME-class encoders prepend a silent Xing/Info VBR header frame.
         # If left in, it inserts ~26 ms of silence at the splice point.
         reenc_audio = _strip_xing_frame(reenc_audio)
+
+        # Drop the encoder-priming audio frames that correspond to the
+        # lead-in PCM we added above. After this strip, the first remaining
+        # frame represents real audio starting at frames[first_paste_frame].
+        for _ in range(priming_drop_frames):
+            if len(reenc_audio) < 4:
+                break
+            hdr = parse_frame_header(reenc_audio[:4])
+            if hdr is None:
+                break
+            reenc_audio = reenc_audio[hdr["frame_size"]:]
+
         reenc_bytes = reenc_audio
 
     # If the paste extends past the original track end AND the re-encode block
