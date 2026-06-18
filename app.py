@@ -71,6 +71,10 @@ DEFAULT_STATE = {
     "copy_x_dst_end_cue": None,
     "copy_x_repeat_count": 1,
     "copy_x_paste_mode": "ADD",
+    "stem_keep": "INSTRUMENTAL",
+    "stem_use_section": False,
+    "stem_start_cue": 1,
+    "stem_end_cue": 2,
 }
 
 
@@ -415,6 +419,16 @@ def run_job(params: dict):
         mod.COPY_X_REPEAT_COUNT  = max(1, int(params.get("copy_x_repeat_count") or 1))
         raw_mode = (params.get("copy_x_paste_mode") or "ADD").upper()
         mod.COPY_X_PASTE_MODE    = "REPLACE" if raw_mode == "REPLACE" else "ADD"
+
+    elif params["mode"] == "STEM_SEPARATION":
+        raw_keep = (params.get("stem_keep") or "INSTRUMENTAL").upper()
+        mod.STEM_KEEP = "VOCALS" if raw_keep == "VOCALS" else "INSTRUMENTAL"
+        if bool(params.get("stem_use_section", False)):
+            mod.STEM_START_CUE = int(params["stem_start_cue"])
+            mod.STEM_END_CUE   = int(params["stem_end_cue"])
+        else:
+            mod.STEM_START_CUE = None
+            mod.STEM_END_CUE   = None
 
     buf = io.StringIO()
     try:

@@ -254,6 +254,7 @@
       <button class="tab" data-mode="COMPRESS">Compress</button>
       <button class="tab" data-mode="COPY_BEATS_BETWEEN_CUES">Copy beats</button>
       <button class="tab" data-mode="COPY_BEATS_BETWEEN_TRACKS">Copy from other track</button>
+      <button class="tab" data-mode="STEM_SEPARATION">Stem separation</button>
     </div>
   </div>
 
@@ -496,6 +497,42 @@
     </div>
   </div>
 
+  <!-- ── STEM_SEPARATION ──────────────────────────────── -->
+  <div class="card mode-panel" id="panel-STEM_SEPARATION">
+    <h2>Stem separation</h2>
+    <p class="hint" style="margin-bottom:14px;">
+      Replace the track (or a selected section) with one isolated stem — either
+      the instrumental (vocals removed) or the vocals only. Uses audio-separator
+      MDX-Net; the first run on a track takes 30 s–2 min and is cached for re-use.
+    </p>
+    <div class="field">
+      <label>Keep stem</label>
+      <div class="tabs" id="stem-keep-tabs">
+        <button class="tab" data-stem="INSTRUMENTAL">Instrumental (no vocals)</button>
+        <button class="tab" data-stem="VOCALS">Vocals only</button>
+      </div>
+    </div>
+    <div class="field" style="margin-top:8px;">
+      <div class="toggle-row">
+        <button class="toggle" id="stem-section-toggle"></button>
+        <span class="toggle-label" id="stem-section-label"></span>
+      </div>
+      <div class="hint">Off: replace the entire track. On: replace only the audio between the two cues; everything outside stays bit-identical (FLAC/WAV) or byte-copied (MP3).</div>
+    </div>
+    <div id="stem-section-picker" class="grid2" style="display:none;">
+      <div class="field">
+        <label>Section start</label>
+        <div class="cue-grid" id="stem-start-btns"></div>
+        <div class="cue-time" id="stem-start-time"></div>
+      </div>
+      <div class="field">
+        <label>Section end</label>
+        <div class="cue-grid" id="stem-end-btns"></div>
+        <div class="cue-time" id="stem-end-time"></div>
+      </div>
+    </div>
+  </div>
+
   <!-- ── Run ───────────────────────────────────────────── -->
   <button id="run-btn">Run</button>
 
@@ -598,6 +635,15 @@ function applyState() {
   sourceSelectedId = state.copy_x_source_track_id ?? null;
   sourceFilename   = state.copy_x_source_filename || "";
 
+  // Stem separation
+  state.stem_keep         = state.stem_keep || "INSTRUMENTAL";
+  state.stem_use_section  = state.stem_use_section === true;
+  state.stem_start_cue    = state.stem_start_cue ?? 1;
+  state.stem_end_cue      = state.stem_end_cue   ?? 2;
+  setStemKeepTab(state.stem_keep);
+  setToggle("stem-section-toggle", state.stem_use_section);
+  updateStemSectionUI();
+
   updateSilenceSourceUI();
   setBitrateTab(state.compress_bitrate || 320);
   updateReverbParamsVisibility();
@@ -611,6 +657,7 @@ const MODE_DEFAULTS = {
   COMPRESS:                 "LQ",
   COPY_BEATS_BETWEEN_CUES:  "(Loop Edit)",
   COPY_BEATS_BETWEEN_TRACKS:"(Cross Edit)",
+  STEM_SEPARATION:          "(Stem)",
 };
 
 function setMode(mode) {
@@ -662,6 +709,7 @@ document.querySelectorAll(".toggle").forEach(btn => {
     if (btn.id === "silence-cue-toggle") updateSilenceSourceUI();
     if (btn.id === "paste-mode-toggle")  updatePasteModeUI();
     if (btn.id === "cbx-paste-mode-toggle") updateCbxPasteModeUI();
+    if (btn.id === "stem-section-toggle") updateStemSectionUI();
     if (btn.id === "search-db-toggle") {
       state.search_full_db = getToggle("search-db-toggle");
       // Reload DB tracks if enabling and not yet loaded
@@ -707,6 +755,25 @@ function updateCbxPasteModeUI() {
 function updateCbxRepeatFieldVisibility() {
   const noEndCue = state.copy_x_dst_end_cue === null || state.copy_x_dst_end_cue === undefined;
   document.getElementById("cbx-repeat-field").style.display = noEndCue ? "block" : "none";
+}
+
+function setStemKeepTab(val) {
+  document.querySelectorAll(".tab[data-stem]").forEach(t =>
+    t.classList.toggle("active", t.dataset.stem === val)
+  );
+  state.stem_keep = val;
+}
+document.getElementById("stem-keep-tabs").addEventListener("click", e => {
+  const btn = e.target.closest("[data-stem]");
+  if (btn) setStemKeepTab(btn.dataset.stem);
+});
+
+function updateStemSectionUI() {
+  const useSection = getToggle("stem-section-toggle");
+  state.stem_use_section = useSection;
+  document.getElementById("stem-section-label").textContent =
+    useSection ? "Replace only a section (between two cues)" : "Replace whole track";
+  document.getElementById("stem-section-picker").style.display = useSection ? "grid" : "none";
 }
 
 function updateFormatMatch() {
@@ -1093,6 +1160,10 @@ function rebuildCueBtns() {
     state.copy_x_dst_end_cue = v;
     updateCbxRepeatFieldVisibility();
   }, hotcues);
+
+  // Stem separation section cues (use the target track's hotcues)
+  makeCueBtns("stem-start-btns", state.stem_start_cue || 1, "stem-start-time", v => { state.stem_start_cue = v; });
+  makeCueBtns("stem-end-btns",   state.stem_end_cue   || 2, "stem-end-time",   v => { state.stem_end_cue   = v; });
 }
 
 function fmtSecs(s) {
@@ -1166,6 +1237,12 @@ document.getElementById("run-btn").addEventListener("click", async () => {
     copy_x_dst_end_cue:     state.copy_x_dst_end_cue   ?? null,
     copy_x_repeat_count:    parseInt(document.getElementById("copy_x_repeat_count").value) || 1,
     copy_x_paste_mode:      getToggle("cbx-paste-mode-toggle") ? "REPLACE" : "ADD",
+
+    // STEM_SEPARATION
+    stem_keep:        state.stem_keep || "INSTRUMENTAL",
+    stem_use_section: getToggle("stem-section-toggle"),
+    stem_start_cue:   state.stem_start_cue || 1,
+    stem_end_cue:     state.stem_end_cue   || 2,
   };
 
   // persist state
