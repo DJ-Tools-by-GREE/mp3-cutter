@@ -1873,6 +1873,35 @@ def _verify_mp3_copy_beats_splices(
             return
         region = out_mono[lo:hi]
 
+        # Suppress silence/click checks when the splice is at (or within
+        # one MP3 frame of) end-of-file: libmp3lame's encoder flush emits
+        # a partial silent tail, and the inspection window has no real
+        # post-splice audio to balance against. Either condition alone
+        # is enough to false-positive a "silence gap" warning.
+        eof_guard_samples = int(0.05 * sample_rate)  # 50 ms ≈ ~2 MP3 frames
+        near_eof = (len(out_mono) - splice) < eof_guard_samples
+
+        # Split context: the silence/click checks should fire only when
+        # BOTH halves of the inspection window are clearly non-silent —
+        # otherwise a natural fade or EOF tail trips them.
+        mid = splice - lo
+        pre  = region[:mid]
+        post = region[mid:]
+
+        def _p75_db(arr):
+            if len(arr) < int(0.005 * sample_rate):
+                return None
+            w = max(16, int(0.002 * sample_rate))
+            h = max(8,  int(0.001 * sample_rate))
+            vals = []
+            for i in range(0, len(arr) - w, h):
+                rms = np.sqrt((arr[i:i + w] ** 2).mean())
+                vals.append(20 * np.log10(rms + 1e-10))
+            return float(np.percentile(vals, 75)) if vals else None
+
+        pre_ctx  = _p75_db(pre)
+        post_ctx = _p75_db(post)
+
         # ── silence gap ──────────────────────────────────
         win = max(16, int(0.002 * sample_rate))
         hop = max(8,  int(0.001 * sample_rate))
@@ -1880,33 +1909,36 @@ def _verify_mp3_copy_beats_splices(
         for i in range(0, len(region) - win, hop):
             rms = np.sqrt((region[i:i + win] ** 2).mean())
             rms_db.append(20 * np.log10(rms + 1e-10))
-        if rms_db:
+        loud_both_sides = (
+            pre_ctx  is not None and pre_ctx  > -25 and
+            post_ctx is not None and post_ctx > -25
+        )
+        if rms_db and loud_both_sides and not near_eof:
             rms_db = np.array(rms_db)
-            ctx = np.percentile(rms_db, 75)
-            # only flag if the surrounding audio is clearly non-silent
-            if ctx > -25:
-                quiet = np.where(rms_db < silence_thresh_db)[0]
-                if len(quiet):
-                    gap_ms = (quiet[-1] - quiet[0] + 1) * hop * 1000 / sample_rate
-                    gs = lo + quiet[0] * hop
-                    findings.append((
-                        "silence", _t(gs),
-                        f"{label}: ~{gap_ms:.1f} ms quiet stretch "
-                        f"({rms_db[quiet[0]]:.1f} dBFS vs ctx {ctx:.1f} dBFS)"
-                    ))
+            quiet = np.where(rms_db < silence_thresh_db)[0]
+            if len(quiet):
+                gap_ms = (quiet[-1] - quiet[0] + 1) * hop * 1000 / sample_rate
+                gs = lo + quiet[0] * hop
+                findings.append((
+                    "silence", _t(gs),
+                    f"{label}: ~{gap_ms:.1f} ms quiet stretch "
+                    f"({rms_db[quiet[0]]:.1f} dBFS vs pre {pre_ctx:.1f} / "
+                    f"post {post_ctx:.1f} dBFS)"
+                ))
 
         # ── click / discontinuity ────────────────────────
-        d = np.abs(np.diff(region))
-        i = int(np.argmax(d))
-        baseline = np.percentile(d, 99)
-        if d[i] > max(click_thresh, baseline * 6):
-            cs = lo + i
-            if abs(cs - splice) <= int(0.002 * sample_rate):
-                findings.append((
-                    "click", _t(cs),
-                    f"{label}: |Δ|={d[i]:.3f} discontinuity "
-                    f"(baseline P99 |Δ|={baseline:.3f})"
-                ))
+        if loud_both_sides and not near_eof:
+            d = np.abs(np.diff(region))
+            i = int(np.argmax(d))
+            baseline = np.percentile(d, 99)
+            if d[i] > max(click_thresh, baseline * 6):
+                cs = lo + i
+                if abs(cs - splice) <= int(0.002 * sample_rate):
+                    findings.append((
+                        "click", _t(cs),
+                        f"{label}: |Δ|={d[i]:.3f} discontinuity "
+                        f"(baseline P99 |Δ|={baseline:.3f})"
+                    ))
 
         # ── timing offset (leading splice only) ──────────
         if with_offset and splice > 0:
