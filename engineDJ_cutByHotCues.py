@@ -1900,17 +1900,27 @@ def stem_separation_wav(input_path, output_path, stem_keep, section_start=None, 
 
 
 def stem_separation_m4a(input_path, output_path, stem_keep, section_start=None, section_end=None):
-    """M4A always involves decode → splice → re-encode (lossy in, lossy out).
-    Bitrate matches the source so quality is preserved as well as AAC allows."""
+    """M4A stem separation.
+
+    Whole-track replacement: decode → splice → re-encode the whole file (no way
+    around it — every sample changes).
+
+    Section replacement: decode → splice the section in PCM → encode ONLY the
+    section as a new AAC stream → ffmpeg-frame-copy parts A and B from the
+    original (lossless, no re-encoding) → concat all three. The audio outside
+    [section_start, section_end) is byte-copied at AAC frame granularity, same
+    approach as cut_m4a / insert_silence_m4a. Frame snap is ~23 ms (1024
+    samples at 44100 Hz)."""
     try:
         m4a_info            = MP4(input_path)
         encode_bitrate_kbps = max(128, min(320, m4a_info.info.bitrate // 1000))
     except Exception:
         encode_bitrate_kbps = 256
 
+    stem = "instrumental" if stem_keep.upper() == "INSTRUMENTAL" else "vocals"
+
     with tempfile.TemporaryDirectory() as tmp_dir:
-        tmp_wav     = os.path.join(tmp_dir, "decoded.wav")
-        tmp_out_wav = os.path.join(tmp_dir, "processed.wav")
+        tmp_wav = os.path.join(tmp_dir, "decoded.wav")
 
         r = subprocess.run(
             ["ffmpeg", "-y", "-i", input_path, tmp_wav],
@@ -1920,30 +1930,77 @@ def stem_separation_m4a(input_path, output_path, stem_keep, section_start=None, 
             print(f"Error: ffmpeg decode failed:\n{r.stderr}")
             sys.exit(1)
 
-        info = sf.info(tmp_wav)
+        info        = sf.info(tmp_wav)
         sample_rate = info.samplerate
         subtype     = info.subtype
         pcm, _ = sf.read(tmp_wav, dtype="float64", always_2d=True)
-
-        stem = "instrumental" if stem_keep.upper() == "INSTRUMENTAL" else "vocals"
-        # Run the separator on the original m4a (audio-separator decodes it natively)
-        # so the cache key is tied to the user's source file rather than the temp wav.
+        # Run the separator on the original m4a so the cache key is tied to the
+        # user's source file rather than the temp wav.
         stem_pcm = _load_stem_pcm(input_path, stem, sample_rate, pcm.shape[1])
+        out_pcm  = _splice_stem_pcm(pcm, stem_pcm, section_start, section_end)
 
-        out_pcm = _splice_stem_pcm(pcm, stem_pcm, section_start, section_end)
-        sf.write(tmp_out_wav, out_pcm, sample_rate, subtype=subtype, format="WAV")
+        if section_start is None and section_end is None:
+            # Whole-track: encode everything in one pass.
+            tmp_out_wav = os.path.join(tmp_dir, "processed.wav")
+            sf.write(tmp_out_wav, out_pcm, sample_rate, subtype=subtype, format="WAV")
+            enc = subprocess.run(
+                ["ffmpeg", "-y", "-i", tmp_out_wav,
+                 "-codec:a", "aac", "-b:a", f"{encode_bitrate_kbps}k", output_path],
+                capture_output=True, text=True,
+            )
+            if enc.returncode != 0:
+                print(f"Error: ffmpeg encode failed:\n{enc.stderr}")
+                sys.exit(1)
+        else:
+            # Section: parts A and B are frame-copied from the original; only the
+            # section is freshly encoded.
+            sec_start_i = int(round(section_start))
+            sec_end_i   = int(round(section_end))
+            sec_start_secs = sec_start_i / sample_rate
+            sec_end_secs   = sec_end_i   / sample_rate
 
-        enc = subprocess.run(
-            ["ffmpeg", "-y", "-i", tmp_out_wav,
-             "-codec:a", "aac", "-b:a", f"{encode_bitrate_kbps}k", output_path],
-            capture_output=True, text=True,
-        )
-        if enc.returncode != 0:
-            print(f"Error: ffmpeg encode failed:\n{enc.stderr}")
-            sys.exit(1)
+            part_a       = os.path.join(tmp_dir, "part_a.m4a")
+            part_b       = os.path.join(tmp_dir, "part_b.m4a")
+            section_wav  = os.path.join(tmp_dir, "section.wav")
+            section_m4a  = os.path.join(tmp_dir, "section.m4a")
+            concat_list  = os.path.join(tmp_dir, "concat.txt")
+
+            sf.write(section_wav, out_pcm[sec_start_i:sec_end_i], sample_rate,
+                     subtype=subtype, format="WAV")
+
+            for cmd, label in [
+                (["ffmpeg", "-y", "-i", input_path,
+                  "-t", f"{sec_start_secs:.6f}", "-vn", "-c:a", "copy", part_a],
+                 "trim part A"),
+                (["ffmpeg", "-y", "-i", section_wav,
+                  "-codec:a", "aac", "-b:a", f"{encode_bitrate_kbps}k", section_m4a],
+                 "encode section"),
+                (["ffmpeg", "-y", "-i", input_path,
+                  "-ss", f"{sec_end_secs:.6f}", "-vn", "-c:a", "copy", part_b],
+                 "trim part B"),
+            ]:
+                r = subprocess.run(cmd, capture_output=True, text=True)
+                if r.returncode != 0:
+                    print(f"Error: ffmpeg {label} failed:\n{r.stderr}")
+                    sys.exit(1)
+
+            with open(concat_list, "w") as f:
+                f.write(f"file '{part_a}'\nfile '{section_m4a}'\nfile '{part_b}'\n")
+
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                 "-i", concat_list, "-c", "copy", output_path],
+                capture_output=True, text=True,
+            )
+            if r.returncode != 0:
+                print(f"Error: ffmpeg concat failed:\n{r.stderr}")
+                sys.exit(1)
 
     _copy_metadata(input_path, output_path, ".m4a")
     _print_stem_stats(sample_rate, len(out_pcm), stem_keep, section_start, section_end, output_path)
+    if section_start is not None:
+        print(f"  Note          : section newly encoded (AAC); audio outside is "
+              f"frame-copied losslessly")
 
 
 def stem_separation_mp3(input_path, output_path, stem_keep, section_start=None, section_end=None):
