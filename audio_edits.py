@@ -26,7 +26,13 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-import engineDJ_cutByHotCues as _engine
+# Works both standalone (top-level module) and when vendored into a package
+# (e.g. djlib's src/djlib/vendor/mp3_cutter/). Keeping this dual-mode lets the
+# vendored copy stay byte-identical to the source for clean drift detection.
+try:  # vendored: engine sits beside us in the same package
+    from . import engineDJ_cutByHotCues as _engine
+except ImportError:  # standalone: engine is a top-level module on sys.path
+    import engineDJ_cutByHotCues as _engine
 
 __all__ = [
     "SUPPORTED_EXTS",
