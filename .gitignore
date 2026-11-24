@@ -5,3 +5,4 @@ __pycache__/
 # *.mp3
 node_modules
 .venv
+.DS_Store
